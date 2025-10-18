@@ -5,6 +5,8 @@ Configuration management for Delta Neutral Bot
 import os
 from dataclasses import dataclass
 from typing import Optional
+import lighter
+import asyncio
 
 
 @dataclass
@@ -88,8 +90,44 @@ class BotConfig:
             use_batch_mode=get_optional_env('USE_BATCH_MODE', 'false').lower() == 'true',
         )
     
+    async def get_market_max_leverage(self) -> int:
+        """
+        Fetch maximum leverage allowed for the configured market from Lighter API.
+        
+        Returns:
+            Maximum leverage as an integer (e.g., 20 for 20x leverage)
+        
+        Raises:
+            Exception if unable to fetch market information
+        """
+        try:
+            configuration = lighter.Configuration(self.base_url)
+            api_client = lighter.ApiClient(configuration)
+            order_api = lighter.OrderApi(api_client)
+            
+            # Fetch order book details for the market
+            order_book_details = await order_api.order_book_details(market_id=self.market_index)
+            
+            await api_client.close()
+            
+            if order_book_details.order_book_details:
+                for detail in order_book_details.order_book_details:
+                    if detail.market_id == self.market_index:
+                        # min_initial_margin_fraction is in basis points (1/10000)
+                        # For example: 500 means 0.05 (5%), which allows 20x leverage
+                        min_margin_fraction = detail.min_initial_margin_fraction / 10000.0
+                        max_leverage = int(1.0 / min_margin_fraction)
+                        return max_leverage
+                
+                raise ValueError(f"Market {self.market_index} not found in order book details")
+            else:
+                raise ValueError("No order book details returned from API")
+                
+        except Exception as e:
+            raise Exception(f"Failed to fetch market max leverage: {e}")
+    
     def validate(self) -> bool:
-        """Validate configuration parameters"""
+        """Validate configuration parameters (basic validation without API calls)"""
         if self.max_slippage < 0 or self.max_slippage > 1:
             raise ValueError("max_slippage must be between 0 and 1")
         
@@ -100,8 +138,8 @@ class BotConfig:
         if self.base_amount_in_usdt and self.base_amount_in_usdt <= 0:
             raise ValueError("base_amount_in_usdt must be positive")
         
-        if self.leverage < 1 or self.leverage > 20:
-            raise ValueError("leverage must be between 1 and 20")
+        if self.leverage < 1:
+            raise ValueError("leverage must be at least 1")
         
         if self.margin_mode not in [0, 1]:
             raise ValueError("margin_mode must be 0 (cross) or 1 (isolated)")
@@ -122,6 +160,36 @@ class BotConfig:
             raise ValueError("account1_index and account2_index must be different")
         
         return True
+    
+    async def validate_with_api(self) -> bool:
+        """
+        Validate configuration parameters including API-based checks.
+        This should be called after basic validate() and checks leverage against Lighter's limits.
+        
+        Returns:
+            True if all validations pass
+        
+        Raises:
+            ValueError if any validation fails
+        """
+        # First run basic validation
+        self.validate()
+        
+        # Fetch max leverage from Lighter API
+        try:
+            max_leverage = await self.get_market_max_leverage()
+            
+            if self.leverage > max_leverage:
+                raise ValueError(
+                    f"Configured leverage ({self.leverage}x) exceeds the maximum allowed "
+                    f"for market {self.market_index} ({max_leverage}x). "
+                    f"Please set LEVERAGE to {max_leverage} or lower in your .env file."
+                )
+            
+            return True
+            
+        except Exception as e:
+            raise Exception(f"API validation failed: {e}")
     
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'BotConfig':

@@ -478,6 +478,21 @@ async def main():
     logger.info(f"  Batch Mode: {config.use_batch_mode}")
     logger.info("")
     
+    # Validate leverage against Lighter API limits
+    logger.info("Validating configuration against Lighter API...")
+    try:
+        await config.validate_with_api()
+        max_leverage = await config.get_market_max_leverage()
+        logger.info(f"✅ Leverage validation passed")
+        logger.info(f"   Market {config.market_index} max leverage: {max_leverage}x")
+        logger.info(f"   Your configured leverage: {config.leverage}x")
+    except Exception as e:
+        logger.error(f"❌ Validation failed: {e}")
+        logger.error("\nPlease check your configuration and try again.")
+        sys.exit(1)
+    
+    logger.info("")
+    
     # Create and run orchestrator
     orchestrator = DeltaNeutralOrchestrator(config)
     await orchestrator.run_continuous()
