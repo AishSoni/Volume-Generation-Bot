@@ -1,19 +1,21 @@
 """
-Configuration management for Delta Neutral Bot
+Configuration Management for Delta Neutral Bot
+
+Handles loading, validation, and management of bot configuration
+from environment variables.
 """
 
 import os
 from dataclasses import dataclass
 from typing import Optional
 import lighter
-import asyncio
 
 
 @dataclass
 class BotConfig:
-    """Configuration for the Delta Neutral Bot"""
+    """Bot configuration loaded from environment variables"""
     
-    # Lighter API Configuration
+    # Lighter API
     base_url: str
     
     # Account 1 (Long positions)
@@ -27,96 +29,82 @@ class BotConfig:
     account2_api_key_index: int
     
     # Trading Parameters
-    market_index: int  # Default/fallback market (kept for backwards compatibility)
-    market_whitelist: list[int]  # List of allowed market indices to randomly select from
-    base_amount: int  # Base asset amount (e.g., 100000 = 0.01 ETH for 4 decimal precision)
-    base_amount_in_usdt: Optional[float]  # Optional: specify trade size in USDT instead of base asset
-    max_slippage: float  # Maximum acceptable slippage (e.g., 0.01 = 1%)
-    leverage: int  # Trading leverage (1-20) or base leverage for dynamic mode
-    use_dynamic_leverage: bool  # If True, randomly select leverage between (max-5) and max for each trade
-    leverage_buffer: int  # Buffer below max leverage when using dynamic mode (default: 5)
-    margin_mode: int  # 0 = cross margin, 1 = isolated margin
+    market_index: int
+    market_whitelist: list[int]
+    base_amount: int
+    base_amount_in_usdt: Optional[float]
+    max_slippage: float
+    leverage: int
+    use_dynamic_leverage: bool
+    leverage_buffer: int
+    margin_mode: int
     
     # Bot Behavior
-    interval_seconds: int  # Time between NEW trades (deprecated - use min/max_open_delay)
-    min_open_delay: int  # Minimum seconds before opening new trade
-    max_open_delay: int  # Maximum seconds before opening new trade
-    min_close_delay: int  # Minimum seconds before closing position
-    max_close_delay: int  # Maximum seconds before closing position
-    max_trades: int  # Maximum number of trades (0 = unlimited)
-    use_batch_mode: bool  # Whether to use batch transactions
+    interval_seconds: int  # Deprecated
+    min_open_delay: int
+    max_open_delay: int
+    min_close_delay: int
+    max_close_delay: int
+    max_trades: int
+    use_batch_mode: bool
     
     @classmethod
     def from_env(cls) -> 'BotConfig':
-        """Create configuration from environment variables"""
+        """Load configuration from environment variables"""
         
-        # Helper function to get required env var
         def get_required_env(key: str) -> str:
+            """Get required environment variable or raise error"""
             value = os.getenv(key)
             if value is None:
                 raise ValueError(f"Required environment variable {key} is not set")
             return value
         
-        # Helper function to get optional env var with default
         def get_optional_env(key: str, default: str) -> str:
+            """Get optional environment variable with default"""
             return os.getenv(key, default)
         
-        # Helper to ensure private key has 0x prefix
         def ensure_0x_prefix(key: str) -> str:
+            """Ensure private key has 0x prefix"""
             return key if key.startswith('0x') else f'0x{key}'
         
-        # Helper to parse market whitelist
         def parse_market_whitelist(whitelist_str: str, fallback_market: int) -> list[int]:
-            """Parse comma-separated market indices from env var"""
-            if not whitelist_str or whitelist_str.strip() == '':
-                # If no whitelist provided, use the single market_index
+            """Parse comma-separated market IDs from string"""
+            if not whitelist_str or not whitelist_str.strip():
                 return [fallback_market]
             
             try:
                 markets = [int(m.strip()) for m in whitelist_str.split(',') if m.strip()]
-                if not markets:
-                    return [fallback_market]
-                return markets
+                return markets if markets else [fallback_market]
             except ValueError as e:
-                raise ValueError(f"Invalid MARKET_WHITELIST format. Must be comma-separated integers: {e}")
+                raise ValueError(f"Invalid MARKET_WHITELIST format: {e}")
         
-        # Parse market configuration
         market_index = int(get_optional_env('MARKET_INDEX', '0'))
         market_whitelist_str = get_optional_env('MARKET_WHITELIST', '')
         market_whitelist = parse_market_whitelist(market_whitelist_str, market_index)
         
         return cls(
-            # API Configuration
             base_url=get_optional_env('BASE_URL', 'https://testnet.zklighter.elliot.ai'),
-            
-            # Account 1 Configuration
             account1_private_key=ensure_0x_prefix(get_required_env('ACCOUNT1_PRIVATE_KEY')),
             account1_index=int(get_required_env('ACCOUNT1_INDEX')),
             account1_api_key_index=int(get_optional_env('ACCOUNT1_API_KEY_INDEX', '0')),
-            
-            # Account 2 Configuration
             account2_private_key=ensure_0x_prefix(get_required_env('ACCOUNT2_PRIVATE_KEY')),
             account2_index=int(get_required_env('ACCOUNT2_INDEX')),
             account2_api_key_index=int(get_optional_env('ACCOUNT2_API_KEY_INDEX', '0')),
-            
-            # Trading Parameters
             market_index=market_index,
             market_whitelist=market_whitelist,
             base_amount=int(get_optional_env('BASE_AMOUNT', '0')),
             base_amount_in_usdt=float(get_optional_env('BASE_AMOUNT_IN_USDT', '0')) or None,
-            max_slippage=float(get_optional_env('MAX_SLIPPAGE', '0.02')),  # Default: 2%
-            leverage=int(get_optional_env('LEVERAGE', '10')),  # Default: 10x leverage
+            max_slippage=float(get_optional_env('MAX_SLIPPAGE', '0.02')),
+            leverage=int(get_optional_env('LEVERAGE', '10')),
             use_dynamic_leverage=get_optional_env('USE_DYNAMIC_LEVERAGE', 'false').lower() == 'true',
-            leverage_buffer=int(get_optional_env('LEVERAGE_BUFFER', '5')),  # Default: 5x buffer
-            margin_mode=int(get_optional_env('MARGIN_MODE', '0')),  # Default: cross margin
-            
-            # Bot Behavior
-            interval_seconds=int(get_optional_env('INTERVAL_SECONDS', '60')),  # Deprecated, kept for backwards compatibility
-            min_open_delay=int(get_optional_env('MIN_OPEN_DELAY', '80')),  # Default: 80 seconds
-            max_open_delay=int(get_optional_env('MAX_OPEN_DELAY', '120')),  # Default: 120 seconds
-            min_close_delay=int(get_optional_env('MIN_CLOSE_DELAY', '30')),  # Default: 30 seconds
-            max_close_delay=int(get_optional_env('MAX_CLOSE_DELAY', '50')),  # Default: 50 seconds
-            max_trades=int(get_optional_env('MAX_TRADES', '0')),  # Default: unlimited
+            leverage_buffer=int(get_optional_env('LEVERAGE_BUFFER', '5')),
+            margin_mode=int(get_optional_env('MARGIN_MODE', '0')),
+            interval_seconds=int(get_optional_env('INTERVAL_SECONDS', '60')),
+            min_open_delay=int(get_optional_env('MIN_OPEN_DELAY', '80')),
+            max_open_delay=int(get_optional_env('MAX_OPEN_DELAY', '120')),
+            min_close_delay=int(get_optional_env('MIN_CLOSE_DELAY', '30')),
+            max_close_delay=int(get_optional_env('MAX_CLOSE_DELAY', '50')),
+            max_trades=int(get_optional_env('MAX_TRADES', '0')),
             use_batch_mode=get_optional_env('USE_BATCH_MODE', 'false').lower() == 'true',
         )
     

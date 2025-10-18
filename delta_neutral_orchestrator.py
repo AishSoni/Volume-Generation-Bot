@@ -1,18 +1,17 @@
 """
-Delta Neutral Volume Generation Bot for Lighter DEX - Orchestrator
+Delta Neutral Volume Generation Bot for Lighter DEX
 
-This orchestrator manages isolated worker processes for each account to avoid
-signer conflicts. It coordinates simultaneous trades and position closing.
+Orchestrates delta-neutral trading by managing two isolated account workers.
+Each worker handles a single account to prevent signer conflicts.
 """
 
 import asyncio
 import json
 import logging
 import random
-import subprocess
 import sys
 from datetime import datetime
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 import lighter
 from config import BotConfig
@@ -31,65 +30,126 @@ logger = logging.getLogger(__name__)
 
 
 class DeltaNeutralOrchestrator:
-    """Orchestrates trading across two isolated account workers"""
+    """
+    Orchestrates delta-neutral trading across two isolated account workers.
+    
+    Manages simultaneous long/short positions, position lifecycle, and
+    ensures proper isolation between accounts to prevent signer conflicts.
+    """
     
     def __init__(self, config: BotConfig):
         self.config = config
         self.trade_count = 0
         self.success_count = 0
         self.is_running = False
-        self.open_positions = []  # Track open positions for closing
-        self.market_stats = {market_id: {'trades': 0, 'successful': 0} for market_id in config.market_whitelist}
+        self.open_positions = []
+        self.market_stats = {
+            market_id: {'trades': 0, 'successful': 0} 
+            for market_id in config.market_whitelist
+        }
     
     def select_random_market(self) -> int:
         """Randomly select a market from the whitelist"""
         return random.choice(self.config.market_whitelist)
+    
+    async def _get_market_precision(self, market_id: int, fallback_price: float) -> int:
+        """
+        Get the official size_decimals precision for a market from Lighter API.
         
-    async def get_current_price(self, market_index: int) -> Optional[Tuple[float, float]]:
-        """Get current best bid and ask from order book for a specific market"""
+        Args:
+            market_id: Market ID to fetch precision for
+            fallback_price: Price to use for fallback precision guess
+            
+        Returns:
+            Number of decimal places for base amount
+        """
         try:
             configuration = lighter.Configuration(self.config.base_url)
             api_client = lighter.ApiClient(configuration)
             order_api = lighter.OrderApi(api_client)
             
-            order_book = await order_api.order_book_orders(
-                market_id=market_index,
-                limit=1
-            )
+            order_book_details = await order_api.order_book_details(market_id=market_id)
+            await api_client.close()
             
+            if order_book_details.order_book_details:
+                for detail in order_book_details.order_book_details:
+                    if detail.market_id == market_id:
+                        return detail.size_decimals
+            
+            # Fallback if not found
+            logger.warning(f"Could not find size_decimals for market {market_id}, using fallback")
+            return self._fallback_precision(fallback_price)
+            
+        except Exception as e:
+            logger.warning(f"Error fetching market precision: {e}, using fallback")
+            return self._fallback_precision(fallback_price)
+    
+    def _fallback_precision(self, price: float) -> int:
+        """
+        Fallback precision calculation based on asset price.
+        Used only if API call fails.
+        """
+        if price >= 10000:
+            return 5  # BTC-like assets
+        elif price >= 1000:
+            return 4  # ETH-like assets
+        else:
+            return 3  # Most other assets
+        
+    async def get_current_price(self, market_index: int) -> Optional[Tuple[float, float]]:
+        """
+        Fetch current best bid and ask prices from the order book.
+        
+        Args:
+            market_index: Market ID to fetch prices for
+            
+        Returns:
+            Tuple of (best_bid, best_ask) or (None, None) if unavailable
+        """
+        try:
+            configuration = lighter.Configuration(self.config.base_url)
+            api_client = lighter.ApiClient(configuration)
+            order_api = lighter.OrderApi(api_client)
+            
+            order_book = await order_api.order_book_orders(market_id=market_index, limit=1)
             await api_client.close()
             
             if order_book.asks and order_book.bids:
                 best_ask = float(order_book.asks[0].price)
                 best_bid = float(order_book.bids[0].price)
                 return best_bid, best_ask
-            else:
-                logger.warning("Order book has no bids or asks")
-                return None, None
+            
+            logger.warning(f"Order book for market {market_index} has no bids or asks")
+            return None, None
                 
         except Exception as e:
-            logger.error(f"Error fetching current price: {e}")
+            logger.error(f"Error fetching price for market {market_index}: {e}")
             return None, None
     
     async def run_worker_command(self, account_config: dict, command_config: dict) -> dict:
-        """Run a worker process with given configuration"""
-        try:
-            # Prepare full configuration
-            full_config = {
-                'account': account_config,
-                **command_config
-            }
+        """
+        Execute a command in an isolated worker process.
+        
+        Args:
+            account_config: Account credentials and settings
+            command_config: Command type and parameters
             
-            # Start worker process
+        Returns:
+            Dictionary with 'success' status and result or error message
+        """
+        try:
+            full_config = {'account': account_config, **command_config}
+            
+            # Launch isolated worker process
             process = await asyncio.create_subprocess_exec(
-                sys.executable,  # Use same Python interpreter
+                sys.executable,
                 'account_worker.py',
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             
-            # Send configuration to worker
+            # Send configuration and get result
             config_json = json.dumps(full_config)
             stdout, stderr = await process.communicate(input=config_json.encode())
             
@@ -97,28 +157,28 @@ class DeltaNeutralOrchestrator:
                 error_msg = stderr.decode() if stderr else 'Unknown error'
                 return {'success': False, 'error': f'Worker failed: {error_msg}'}
             
-            # Parse result
-            result = json.loads(stdout.decode())
-            return result
+            return json.loads(stdout.decode())
             
         except Exception as e:
             return {'success': False, 'error': f'Worker exception: {str(e)}'}
     
-    async def update_leverage_both_accounts(self, leverage: Optional[int] = None, market_index: Optional[int] = None):
+    async def update_leverage_both_accounts(
+        self, 
+        leverage: Optional[int] = None, 
+        market_index: Optional[int] = None
+    ):
         """
-        Update leverage on both accounts (same leverage for both)
+        Update leverage on both accounts with the same value.
         
         Args:
-            leverage: Leverage to set. If None, uses config.leverage
-            market_index: Market to update leverage for. If None, uses config.market_index
+            leverage: Leverage to set (uses config.leverage if None)
+            market_index: Market ID (uses config.market_index if None)
         """
         actual_leverage = leverage if leverage is not None else self.config.leverage
         actual_market = market_index if market_index is not None else self.config.market_index
         
-        if leverage is not None:
-            logger.info(f"Updating leverage to {actual_leverage}x for market {actual_market}")
-        else:
-            logger.info(f"Updating leverage to {actual_leverage}x (margin mode: {'cross' if self.config.margin_mode == 0 else 'isolated'})")
+        margin_mode = 'cross' if self.config.margin_mode == 0 else 'isolated'
+        logger.info(f"Setting leverage: {actual_leverage}x ({margin_mode} margin)")
         
         account1_config = {
             'base_url': self.config.base_url,
@@ -144,28 +204,31 @@ class DeltaNeutralOrchestrator:
         }
         
         # Update leverage for both accounts in parallel
-        results = await asyncio.gather(
+        await asyncio.gather(
             self.run_worker_command(account1_config, leverage_command),
             self.run_worker_command(account2_config, leverage_command),
             return_exceptions=True
         )
         
-        if leverage is None:
-            logger.info("✅ Leverage updated on both accounts")
+        logger.info("✅ Leverage updated on both accounts")
         return True
     
-    async def update_leverage_for_accounts(self, leverage_account1: int, leverage_account2: int, market_index: int):
+    async def update_leverage_for_accounts(
+        self, 
+        leverage_account1: int, 
+        leverage_account2: int, 
+        market_index: int
+    ):
         """
-        Update leverage independently for each account (for asymmetric leverage)
+        Update leverage independently for each account (asymmetric leverage).
         
         Args:
-            leverage_account1: Leverage for account 1 (long position)
-            leverage_account2: Leverage for account 2 (short position)
-            market_index: Market to update leverage for
+            leverage_account1: Leverage for account 1 (long)
+            leverage_account2: Leverage for account 2 (short)
+            market_index: Market ID
         """
-        logger.info(f"Updating leverage for market {market_index}:")
-        logger.info(f"  Account 1 (Long): {leverage_account1}x")
-        logger.info(f"  Account 2 (Short): {leverage_account2}x")
+        logger.info(f"Setting asymmetric leverage for market {market_index}:")
+        logger.info(f"  Long: {leverage_account1}x | Short: {leverage_account2}x")
         
         account1_config = {
             'base_url': self.config.base_url,
@@ -262,74 +325,34 @@ class DeltaNeutralOrchestrator:
                 logger.warning(f"Spread ({spread_percentage:.4f}%) exceeds max ({max_spread_percentage}%) - skipping trade")
                 return False, f"Spread too wide for {market_symbol}"
             
-            # Calculate base_amount (convert from USDT if specified)
+            # Calculate base_amount from USDT margin target
             if self.config.base_amount_in_usdt:
-                # Use mid-price for conversion
                 mid_price = (best_bid + best_ask) / 2
                 
-                # Get the leverage being used for this trade
-                effective_leverage_long = leverage_long if self.config.use_dynamic_leverage else self.config.leverage
-                effective_leverage_short = leverage_short if self.config.use_dynamic_leverage else self.config.leverage
+                # Calculate effective leverage for this trade
+                effective_leverage_long = (
+                    leverage_long if self.config.use_dynamic_leverage 
+                    else self.config.leverage
+                )
+                effective_leverage_short = (
+                    leverage_short if self.config.use_dynamic_leverage 
+                    else self.config.leverage
+                )
                 avg_leverage = (effective_leverage_long + effective_leverage_short) / 2
                 
-                # CRITICAL: Get the ACTUAL precision from Lighter API
-                # Don't guess based on price - use the official size_decimals from market info
-                try:
-                    # Fetch market details to get official size_decimals
-                    configuration = lighter.Configuration(self.config.base_url)
-                    api_client = lighter.ApiClient(configuration)
-                    order_api = lighter.OrderApi(api_client)
-                    
-                    order_book_details = await order_api.order_book_details(market_id=selected_market)
-                    await api_client.close()
-                    
-                    # Extract size_decimals from the market details
-                    precision_decimals = None
-                    if order_book_details.order_book_details:
-                        for detail in order_book_details.order_book_details:
-                            if detail.market_id == selected_market:
-                                precision_decimals = detail.size_decimals
-                                break
-                    
-                    if precision_decimals is None:
-                        # Fallback: guess based on price if API call fails
-                        logger.warning(f"Could not fetch size_decimals for market {selected_market}, using price-based fallback")
-                        if mid_price >= 10000:
-                            precision_decimals = 5
-                        elif mid_price >= 1000:
-                            precision_decimals = 4
-                        else:
-                            precision_decimals = 3
-                            
-                except Exception as e:
-                    # Fallback: guess based on price if API call fails
-                    logger.warning(f"Error fetching market details: {e}, using price-based fallback")
-                    if mid_price >= 10000:
-                        precision_decimals = 5
-                    elif mid_price >= 1000:
-                        precision_decimals = 4
-                    else:
-                        precision_decimals = 3
-                
+                # Fetch official precision from Lighter API
+                precision_decimals = await self._get_market_precision(selected_market, mid_price)
                 precision_multiplier = 10 ** precision_decimals
                 
-                # base_amount represents UNITS OF BASE ASSET with dynamic decimal precision
-                # Example with 5 decimals: base_amount = 100000 means 1.00000 BTC
-                # Example with 4 decimals: base_amount = 10000 means 1.0000 ETH
-                # Example with 3 decimals: base_amount = 1000 means 1.000 SOL
-                #
-                # To achieve target margin:
-                # 1. Calculate target notional = margin * leverage
-                # 2. Convert notional to asset units: asset_amount = notional_usd / asset_price
-                # 3. Convert to base_amount units: base_amount = asset_amount * precision_multiplier
-                
+                # Calculate base_amount from margin target
+                # Formula: base_amount = (margin * leverage / price) * precision_multiplier
                 target_notional = self.config.base_amount_in_usdt * avg_leverage
-                asset_amount = target_notional / mid_price  # Asset units needed for this notional
-                base_amount = max(1, round(asset_amount * precision_multiplier))  # Convert to precision units
+                asset_amount = target_notional / mid_price
+                base_amount = max(1, round(asset_amount * precision_multiplier))
                 
                 # Calculate actual values for logging
-                base_amount_decimal = base_amount / precision_multiplier  # Actual asset amount
-                actual_notional_usd = base_amount_decimal * mid_price  # Dollar value
+                base_amount_decimal = base_amount / precision_multiplier
+                actual_notional_usd = base_amount_decimal * mid_price
                 margin_long = actual_notional_usd / effective_leverage_long
                 margin_short = actual_notional_usd / effective_leverage_short
                 

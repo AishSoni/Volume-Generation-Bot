@@ -37,11 +37,15 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+test_*.py
+!test_market_whitelist.py
 
 # Personal notes
 notes.txt
 TODO.txt
 
+# Removed/deprecated files
 .env copy
+*.env.bak
 /references
 /lighter-python
