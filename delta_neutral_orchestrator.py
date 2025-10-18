@@ -39,16 +39,21 @@ class DeltaNeutralOrchestrator:
         self.success_count = 0
         self.is_running = False
         self.open_positions = []  # Track open positions for closing
+        self.market_stats = {market_id: {'trades': 0, 'successful': 0} for market_id in config.market_whitelist}
+    
+    def select_random_market(self) -> int:
+        """Randomly select a market from the whitelist"""
+        return random.choice(self.config.market_whitelist)
         
-    async def get_current_price(self) -> Optional[Tuple[float, float]]:
-        """Get current best bid and ask from order book"""
+    async def get_current_price(self, market_index: int) -> Optional[Tuple[float, float]]:
+        """Get current best bid and ask from order book for a specific market"""
         try:
             configuration = lighter.Configuration(self.config.base_url)
             api_client = lighter.ApiClient(configuration)
             order_api = lighter.OrderApi(api_client)
             
             order_book = await order_api.order_book_orders(
-                market_id=self.config.market_index,
+                market_id=market_index,
                 limit=1
             )
             
@@ -99,9 +104,21 @@ class DeltaNeutralOrchestrator:
         except Exception as e:
             return {'success': False, 'error': f'Worker exception: {str(e)}'}
     
-    async def update_leverage_both_accounts(self):
-        """Update leverage on both accounts"""
-        logger.info(f"Updating leverage to {self.config.leverage}x (margin mode: {'cross' if self.config.margin_mode == 0 else 'isolated'})")
+    async def update_leverage_both_accounts(self, leverage: Optional[int] = None, market_index: Optional[int] = None):
+        """
+        Update leverage on both accounts (same leverage for both)
+        
+        Args:
+            leverage: Leverage to set. If None, uses config.leverage
+            market_index: Market to update leverage for. If None, uses config.market_index
+        """
+        actual_leverage = leverage if leverage is not None else self.config.leverage
+        actual_market = market_index if market_index is not None else self.config.market_index
+        
+        if leverage is not None:
+            logger.info(f"Updating leverage to {actual_leverage}x for market {actual_market}")
+        else:
+            logger.info(f"Updating leverage to {actual_leverage}x (margin mode: {'cross' if self.config.margin_mode == 0 else 'isolated'})")
         
         account1_config = {
             'base_url': self.config.base_url,
@@ -120,8 +137,8 @@ class DeltaNeutralOrchestrator:
         leverage_command = {
             'command': 'update_leverage',
             'leverage': {
-                'market_index': self.config.market_index,
-                'leverage': self.config.leverage,
+                'market_index': actual_market,
+                'leverage': actual_leverage,
                 'margin_mode': self.config.margin_mode
             }
         }
@@ -133,16 +150,108 @@ class DeltaNeutralOrchestrator:
             return_exceptions=True
         )
         
+        if leverage is None:
+            logger.info("✅ Leverage updated on both accounts")
+        return True
+    
+    async def update_leverage_for_accounts(self, leverage_account1: int, leverage_account2: int, market_index: int):
+        """
+        Update leverage independently for each account (for asymmetric leverage)
+        
+        Args:
+            leverage_account1: Leverage for account 1 (long position)
+            leverage_account2: Leverage for account 2 (short position)
+            market_index: Market to update leverage for
+        """
+        logger.info(f"Updating leverage for market {market_index}:")
+        logger.info(f"  Account 1 (Long): {leverage_account1}x")
+        logger.info(f"  Account 2 (Short): {leverage_account2}x")
+        
+        account1_config = {
+            'base_url': self.config.base_url,
+            'private_key': self.config.account1_private_key,
+            'account_index': self.config.account1_index,
+            'api_key_index': self.config.account1_api_key_index,
+        }
+        
+        account2_config = {
+            'base_url': self.config.base_url,
+            'private_key': self.config.account2_private_key,
+            'account_index': self.config.account2_index,
+            'api_key_index': self.config.account2_api_key_index,
+        }
+        
+        leverage_command_account1 = {
+            'command': 'update_leverage',
+            'leverage': {
+                'market_index': market_index,
+                'leverage': leverage_account1,
+                'margin_mode': self.config.margin_mode
+            }
+        }
+        
+        leverage_command_account2 = {
+            'command': 'update_leverage',
+            'leverage': {
+                'market_index': market_index,
+                'leverage': leverage_account2,
+                'margin_mode': self.config.margin_mode
+            }
+        }
+        
+        # Update leverage for both accounts in parallel with different values
+        results = await asyncio.gather(
+            self.run_worker_command(account1_config, leverage_command_account1),
+            self.run_worker_command(account2_config, leverage_command_account2),
+            return_exceptions=True
+        )
+        
         logger.info("✅ Leverage updated on both accounts")
         return True
     
     async def execute_delta_neutral_trade(self) -> Tuple[bool, str]:
         """Execute simultaneous long and short market orders using isolated workers"""
         try:
-            # Get current bid and ask
-            best_bid, best_ask = await self.get_current_price()
+            # Randomly select a market from the whitelist
+            selected_market = self.select_random_market()
+            
+            # Get market info and determine leverage for this trade
+            try:
+                market_info = await self.config.get_market_info(selected_market)
+                market_symbol = market_info['symbol']
+                market_max_leverage = market_info['max_leverage']
+                
+                # Calculate leverage for this trade
+                if self.config.use_dynamic_leverage:
+                    # Select different leverage for each account
+                    leverage_long = self.config.calculate_dynamic_leverage(market_max_leverage)
+                    leverage_short = self.config.calculate_dynamic_leverage(market_max_leverage)
+                    logger.info(f"📊 Selected market: {market_symbol} (ID: {selected_market})")
+                    logger.info(f"   🎲 Dynamic leverage - Long: {leverage_long}x | Short: {leverage_short}x (max: {market_max_leverage}x)")
+                else:
+                    leverage_long = self.config.leverage
+                    leverage_short = self.config.leverage
+                    logger.info(f"📊 Selected market: {market_symbol} (ID: {selected_market})")
+                    
+            except Exception as e:
+                logger.warning(f"Could not fetch market info: {e}")
+                market_symbol = f"Market {selected_market}"
+                leverage_long = self.config.leverage
+                leverage_short = self.config.leverage
+                logger.info(f"📊 Selected market: {market_symbol} (ID: {selected_market})")
+            
+            # Update leverage for each account independently (if dynamic mode)
+            if self.config.use_dynamic_leverage:
+                await self.update_leverage_for_accounts(
+                    leverage_account1=leverage_long,
+                    leverage_account2=leverage_short,
+                    market_index=selected_market
+                )
+            
+            # Get current bid and ask for the selected market
+            best_bid, best_ask = await self.get_current_price(selected_market)
             if not best_bid or not best_ask:
-                return False, "Failed to get current price"
+                return False, f"Failed to get current price for {market_symbol}"
 
             # --- PRE-TRADE SAFEGUARD: Check Bid-Ask Spread ---
             spread = best_ask - best_bid
@@ -151,7 +260,7 @@ class DeltaNeutralOrchestrator:
 
             if spread_percentage > max_spread_percentage:
                 logger.warning(f"Spread ({spread_percentage:.4f}%) exceeds max ({max_spread_percentage}%) - skipping trade")
-                return False, "Spread too wide"
+                return False, f"Spread too wide for {market_symbol}"
             
             # Calculate base_amount (convert from USDT if specified)
             if self.config.base_amount_in_usdt:
@@ -159,14 +268,15 @@ class DeltaNeutralOrchestrator:
                 mid_price = (best_bid + best_ask) / 2
                 # Convert USDT to base asset amount (with 4 decimal precision)
                 base_amount = int((self.config.base_amount_in_usdt / mid_price) * 10000)
-                logger.info(f"Using BASE_AMOUNT_IN_USDT: ${self.config.base_amount_in_usdt:.2f} @ ${mid_price:.2f} = {base_amount / 10000:.4f} ETH")
+                logger.info(f"Using BASE_AMOUNT_IN_USDT: ${self.config.base_amount_in_usdt:.2f} @ ${mid_price:.2f} = {base_amount / 10000:.4f} {market_symbol.split('-')[0]}")
             else:
                 base_amount = self.config.base_amount
             
-            logger.info(f"Executing delta neutral trade:")
+            logger.info(f"Executing delta neutral trade on {market_symbol}:")
             logger.info(f"  Base amount: {base_amount / 10000:.4f}")
             logger.info(f"  Best Bid: ${best_bid:.2f}, Best Ask: ${best_ask:.2f}")
             logger.info(f"  Spread: ${spread:.2f} ({spread_percentage:.3f}%)")
+            logger.info(f"  Long leverage: {leverage_long}x | Short leverage: {leverage_short}x")
             
             # Prepare account configurations
             account1_config = {
@@ -195,7 +305,7 @@ class DeltaNeutralOrchestrator:
             long_command = {
                 'command': 'execute_true_market_order',
                 'order': {
-                    'market_index': self.config.market_index,
+                    'market_index': selected_market,
                     'base_amount': base_amount,
                     'is_ask': False,  # Buy = Long
                     'client_order_index': timestamp_ms % 1000000,
@@ -206,7 +316,7 @@ class DeltaNeutralOrchestrator:
             short_command = {
                 'command': 'execute_true_market_order',
                 'order': {
-                    'market_index': self.config.market_index,
+                    'market_index': selected_market,
                     'base_amount': base_amount,
                     'is_ask': True,  # Sell = Short
                     'client_order_index': (timestamp_ms + 1) % 1000000,
@@ -239,10 +349,15 @@ class DeltaNeutralOrchestrator:
             
             # Both must succeed for delta neutral
             if long_success and short_success:
+                # Update market stats
+                self.market_stats[selected_market]['trades'] += 1
+                self.market_stats[selected_market]['successful'] += 1
+                
                 # Schedule position closing
                 close_delay = random.randint(self.config.min_close_delay, self.config.max_close_delay)
                 position_info = {
-                    'market_index': self.config.market_index,
+                    'market_index': selected_market,
+                    'market_symbol': market_symbol,
                     'base_amount': base_amount,
                     'close_time': asyncio.get_event_loop().time() + close_delay,
                     'close_delay': close_delay,
@@ -250,11 +365,13 @@ class DeltaNeutralOrchestrator:
                 }
                 self.open_positions.append(position_info)
                 
-                logger.info(f"✅ Delta neutral trade executed successfully")
+                logger.info(f"✅ Delta neutral trade executed successfully on {market_symbol}")
                 logger.info(f"📅 Position will close in {close_delay} seconds")
                 return True, "Success"
             else:
-                return False, "One or both orders failed"
+                # Update market stats for failed trade
+                self.market_stats[selected_market]['trades'] += 1
+                return False, f"One or both orders failed for {market_symbol}"
                 
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
@@ -277,12 +394,14 @@ class DeltaNeutralOrchestrator:
                 # Close positions that are ready
                 if positions_to_close:
                     for pos in positions_to_close:
+                        market_symbol = pos.get('market_symbol', f'Market {pos["market_index"]}')
                         logger.info(f"\n{'='*60}")
-                        logger.info(f"Closing positions from Trade #{pos['trade_number']}")
+                        logger.info(f"Closing positions from Trade #{pos['trade_number']} - {market_symbol}")
                         logger.info(f"{'='*60}")
                         await self.close_position_pair(
                             pos['market_index'],
-                            pos['base_amount']
+                            pos['base_amount'],
+                            market_symbol
                         )
                     
                     # Only update the list after closing is complete
@@ -294,9 +413,11 @@ class DeltaNeutralOrchestrator:
                 logger.error(f"Error in close positions task: {e}")
                 await asyncio.sleep(5)
     
-    async def close_position_pair(self, market_index: int, base_amount: int):
-        """Close both long and short positions"""
+    async def close_position_pair(self, market_index: int, base_amount: int, market_symbol: str = None):
+        """Close both long and short positions for a specific market"""
         try:
+            if market_symbol is None:
+                market_symbol = f"Market {market_index}"
             # Prepare account configurations
             account1_config = {
                 'base_url': self.config.base_url,
@@ -438,6 +559,17 @@ class DeltaNeutralOrchestrator:
             except asyncio.CancelledError:
                 pass  # Expected on cancellation
             
+            # Display market statistics
+            if len(self.config.market_whitelist) > 1:
+                logger.info("\n" + "="*60)
+                logger.info("Market Statistics")
+                logger.info("="*60)
+                for market_id in sorted(self.market_stats.keys()):
+                    stats = self.market_stats[market_id]
+                    if stats['trades'] > 0:
+                        success_rate = (stats['successful'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
+                        logger.info(f"  Market {market_id}: {stats['successful']}/{stats['trades']} trades ({success_rate:.1f}% success)")
+            
             logger.info("Bot stopped")
 
 
@@ -462,7 +594,7 @@ async def main():
         logger.info("  ✓ Testnet mode - Safe for testing")
     else:
         logger.warning("  ⚠️  MAINNET MODE - Using real funds!")
-    logger.info(f"  Market Index: {config.market_index}")
+    logger.info(f"  Market Whitelist: {config.market_whitelist} ({len(config.market_whitelist)} market(s))")
     logger.info(f"  Account 1 Index: {config.account1_index}")
     logger.info(f"  Account 2 Index: {config.account2_index}")
     if config.base_amount_in_usdt:
@@ -470,7 +602,10 @@ async def main():
     else:
         logger.info(f"  Base Amount: {config.base_amount / 10000:.4f}")
     logger.info(f"  Max Slippage: {config.max_slippage * 100:.2f}%")
-    logger.info(f"  Leverage: {config.leverage}x")
+    if config.use_dynamic_leverage:
+        logger.info(f"  Leverage: DYNAMIC (market_max - {config.leverage_buffer} to market_max) 🎲")
+    else:
+        logger.info(f"  Leverage: {config.leverage}x (Fixed)")
     logger.info(f"  Margin Mode: {'Cross' if config.margin_mode == 0 else 'Isolated'}")
     logger.info(f"  Interval: {config.interval_seconds}s")
     logger.info(f"  Position Close Delay: {config.min_close_delay}-{config.max_close_delay}s")
