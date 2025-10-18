@@ -133,9 +133,13 @@ EXAMPLE_CONFIG = {
     'account2_index': 2,
     'account2_api_key_index': 0,
     'market_index': 0,
-    'base_amount': 100000,  # 0.01 ETH with 4 decimal precision
-    'max_slippage': 0.02,  # 2%
+    'base_amount': 5000,  # 0.5 ETH with 4 decimal precision
+    'max_slippage': 0.02,  # 2% (note: not used in true market orders)
+    'leverage': 10,  # 10x leverage
+    'margin_mode': 0,  # 0 = cross margin
     'interval_seconds': 60,
+    'min_close_delay': 30,
+    'max_close_delay': 50,
     'max_trades': 0,  # Unlimited
     'use_batch_mode': False,
 }

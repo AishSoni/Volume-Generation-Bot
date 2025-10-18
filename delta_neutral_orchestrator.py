@@ -154,14 +154,11 @@ class DeltaNeutralOrchestrator:
                 return False, "Spread too wide"
             
             base_amount = self.config.base_amount
-            long_max_price = int(best_ask * (1 + self.config.max_slippage))
-            short_min_price = int(best_bid * (1 - self.config.max_slippage))
             
             logger.info(f"Executing delta neutral trade:")
             logger.info(f"  Base amount: {base_amount / 10000:.4f}")
             logger.info(f"  Best Bid: ${best_bid:.2f}, Best Ask: ${best_ask:.2f}")
-            logger.info(f"  Long max price: ${long_max_price:.2f}")
-            logger.info(f"  Short min price: ${short_min_price:.2f}")
+            logger.info(f"  Spread: ${spread:.2f} ({spread_percentage:.3f}%)")
             
             # Prepare account configurations
             account1_config = {
@@ -234,13 +231,11 @@ class DeltaNeutralOrchestrator:
             
             # Both must succeed for delta neutral
             if long_success and short_success:
-                # Schedule position closing (use current trade_count, not +1)
+                # Schedule position closing
                 close_delay = random.randint(self.config.min_close_delay, self.config.max_close_delay)
                 position_info = {
                     'market_index': self.config.market_index,
-                    'base_amount': base_amount,  # Store for closing
-                    'long_price_limit': long_max_price,  # Store close price limits
-                    'short_price_limit': short_min_price,
+                    'base_amount': base_amount,
                     'close_time': asyncio.get_event_loop().time() + close_delay,
                     'close_delay': close_delay,
                     'trade_number': self.trade_count
@@ -279,9 +274,7 @@ class DeltaNeutralOrchestrator:
                         logger.info(f"{'='*60}")
                         await self.close_position_pair(
                             pos['market_index'],
-                            pos['base_amount'],
-                            pos['long_price_limit'],
-                            pos['short_price_limit']
+                            pos['base_amount']
                         )
                     
                     # Only update the list after closing is complete
@@ -293,7 +286,7 @@ class DeltaNeutralOrchestrator:
                 logger.error(f"Error in close positions task: {e}")
                 await asyncio.sleep(5)
     
-    async def close_position_pair(self, market_index: int, base_amount: int, long_price_limit: int, short_price_limit: int):
+    async def close_position_pair(self, market_index: int, base_amount: int):
         """Close both long and short positions"""
         try:
             # Prepare account configurations
@@ -310,30 +303,18 @@ class DeltaNeutralOrchestrator:
                 'account_index': self.config.account2_index,
                 'api_key_index': self.config.account2_api_key_index,
             }
-            
-            # Get current price for closing
-            best_bid, best_ask = await self.get_current_price()
-            if not best_bid or not best_ask:
-                logger.warning("Could not get current price for closing, using original limits")
-                close_long_price = short_price_limit # Fallback to original short price limit for selling
-                close_short_price = long_price_limit # Fallback to original long price limit for buying
-            else:
-                # To close a long position, we sell at the best bid
-                close_long_price = int(best_bid)
-                # To close a short position, we buy at the best ask
-                close_short_price = int(best_ask)
 
-            # To close positions, we also use true market orders with wide boundaries.
-            close_long_execution_price = 1  # Sell to close long
-            close_short_execution_price = 999999999 # Buy to close short
+            # To close positions, we use true market orders with wide boundaries
+            close_long_execution_price = 1  # Sell to close long (accept any price)
+            close_short_execution_price = 999999999  # Buy to close short (accept any price)
 
-            # Close commands with base_amount and price
+            # Close commands
             close_long_command = {
                 'command': 'execute_true_market_order',
                 'order': {
                     'market_index': market_index,
                     'base_amount': base_amount,
-                    'is_ask': True, # Sell to close long
+                    'is_ask': True,  # Sell to close long
                     'client_order_index': int(datetime.now().timestamp() * 1000 + 2) % 1000000,
                     'reduce_only': True,
                     'execution_price': close_long_execution_price
