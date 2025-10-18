@@ -27,6 +27,7 @@ class BotConfig:
     # Trading Parameters
     market_index: int
     base_amount: int  # Base asset amount (e.g., 100000 = 0.01 ETH for 4 decimal precision)
+    base_amount_in_usdt: Optional[float]  # Optional: specify trade size in USDT instead of base asset
     max_slippage: float  # Maximum acceptable slippage (e.g., 0.01 = 1%)
     leverage: int  # Trading leverage (1-20)
     margin_mode: int  # 0 = cross margin, 1 = isolated margin
@@ -73,7 +74,8 @@ class BotConfig:
             
             # Trading Parameters
             market_index=int(get_optional_env('MARKET_INDEX', '0')),
-            base_amount=int(get_optional_env('BASE_AMOUNT', '5000')),  # Default: 0.0005 ETH (~$1 at $2000/ETH)
+            base_amount=int(get_optional_env('BASE_AMOUNT', '0')),
+            base_amount_in_usdt=float(get_optional_env('BASE_AMOUNT_IN_USDT', '0')) or None,
             max_slippage=float(get_optional_env('MAX_SLIPPAGE', '0.02')),  # Default: 2%
             leverage=int(get_optional_env('LEVERAGE', '10')),  # Default: 10x leverage
             margin_mode=int(get_optional_env('MARGIN_MODE', '0')),  # Default: cross margin
@@ -91,8 +93,12 @@ class BotConfig:
         if self.max_slippage < 0 or self.max_slippage > 1:
             raise ValueError("max_slippage must be between 0 and 1")
         
-        if self.base_amount <= 0:
-            raise ValueError("base_amount must be positive")
+        # Validate that either base_amount or base_amount_in_usdt is set
+        if self.base_amount <= 0 and not self.base_amount_in_usdt:
+            raise ValueError("Either base_amount or base_amount_in_usdt must be set")
+        
+        if self.base_amount_in_usdt and self.base_amount_in_usdt <= 0:
+            raise ValueError("base_amount_in_usdt must be positive")
         
         if self.leverage < 1 or self.leverage > 20:
             raise ValueError("leverage must be between 1 and 20")
@@ -134,6 +140,7 @@ EXAMPLE_CONFIG = {
     'account2_api_key_index': 0,
     'market_index': 0,
     'base_amount': 5000,  # 0.5 ETH with 4 decimal precision
+    'base_amount_in_usdt': 100.0,  # Alternative: specify $100 USDT per trade (overrides base_amount)
     'max_slippage': 0.02,  # 2% (note: not used in true market orders)
     'leverage': 10,  # 10x leverage
     'margin_mode': 0,  # 0 = cross margin

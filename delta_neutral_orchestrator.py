@@ -153,7 +153,15 @@ class DeltaNeutralOrchestrator:
                 logger.warning(f"Spread ({spread_percentage:.4f}%) exceeds max ({max_spread_percentage}%) - skipping trade")
                 return False, "Spread too wide"
             
-            base_amount = self.config.base_amount
+            # Calculate base_amount (convert from USDT if specified)
+            if self.config.base_amount_in_usdt:
+                # Use mid-price for conversion
+                mid_price = (best_bid + best_ask) / 2
+                # Convert USDT to base asset amount (with 4 decimal precision)
+                base_amount = int((self.config.base_amount_in_usdt / mid_price) * 10000)
+                logger.info(f"Using BASE_AMOUNT_IN_USDT: ${self.config.base_amount_in_usdt:.2f} @ ${mid_price:.2f} = {base_amount / 10000:.4f} ETH")
+            else:
+                base_amount = self.config.base_amount
             
             logger.info(f"Executing delta neutral trade:")
             logger.info(f"  Base amount: {base_amount / 10000:.4f}")
@@ -457,7 +465,10 @@ async def main():
     logger.info(f"  Market Index: {config.market_index}")
     logger.info(f"  Account 1 Index: {config.account1_index}")
     logger.info(f"  Account 2 Index: {config.account2_index}")
-    logger.info(f"  Base Amount: {config.base_amount / 10000:.4f}")
+    if config.base_amount_in_usdt:
+        logger.info(f"  Trade Size: ${config.base_amount_in_usdt:.2f} USDT (converted to asset at market price)")
+    else:
+        logger.info(f"  Base Amount: {config.base_amount / 10000:.4f}")
     logger.info(f"  Max Slippage: {config.max_slippage * 100:.2f}%")
     logger.info(f"  Leverage: {config.leverage}x")
     logger.info(f"  Margin Mode: {'Cross' if config.margin_mode == 0 else 'Isolated'}")
