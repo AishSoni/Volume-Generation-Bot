@@ -266,14 +266,93 @@ class DeltaNeutralOrchestrator:
             if self.config.base_amount_in_usdt:
                 # Use mid-price for conversion
                 mid_price = (best_bid + best_ask) / 2
-                # Convert USDT to base asset amount (with 4 decimal precision)
-                base_amount = int((self.config.base_amount_in_usdt / mid_price) * 10000)
-                logger.info(f"Using BASE_AMOUNT_IN_USDT: ${self.config.base_amount_in_usdt:.2f} @ ${mid_price:.2f} = {base_amount / 10000:.4f} {market_symbol.split('-')[0]}")
+                
+                # Get the leverage being used for this trade
+                effective_leverage_long = leverage_long if self.config.use_dynamic_leverage else self.config.leverage
+                effective_leverage_short = leverage_short if self.config.use_dynamic_leverage else self.config.leverage
+                avg_leverage = (effective_leverage_long + effective_leverage_short) / 2
+                
+                # CRITICAL: Get the ACTUAL precision from Lighter API
+                # Don't guess based on price - use the official size_decimals from market info
+                try:
+                    # Fetch market details to get official size_decimals
+                    configuration = lighter.Configuration(self.config.base_url)
+                    api_client = lighter.ApiClient(configuration)
+                    order_api = lighter.OrderApi(api_client)
+                    
+                    order_book_details = await order_api.order_book_details(market_id=selected_market)
+                    await api_client.close()
+                    
+                    # Extract size_decimals from the market details
+                    precision_decimals = None
+                    if order_book_details.order_book_details:
+                        for detail in order_book_details.order_book_details:
+                            if detail.market_id == selected_market:
+                                precision_decimals = detail.size_decimals
+                                break
+                    
+                    if precision_decimals is None:
+                        # Fallback: guess based on price if API call fails
+                        logger.warning(f"Could not fetch size_decimals for market {selected_market}, using price-based fallback")
+                        if mid_price >= 10000:
+                            precision_decimals = 5
+                        elif mid_price >= 1000:
+                            precision_decimals = 4
+                        else:
+                            precision_decimals = 3
+                            
+                except Exception as e:
+                    # Fallback: guess based on price if API call fails
+                    logger.warning(f"Error fetching market details: {e}, using price-based fallback")
+                    if mid_price >= 10000:
+                        precision_decimals = 5
+                    elif mid_price >= 1000:
+                        precision_decimals = 4
+                    else:
+                        precision_decimals = 3
+                
+                precision_multiplier = 10 ** precision_decimals
+                
+                # base_amount represents UNITS OF BASE ASSET with dynamic decimal precision
+                # Example with 5 decimals: base_amount = 100000 means 1.00000 BTC
+                # Example with 4 decimals: base_amount = 10000 means 1.0000 ETH
+                # Example with 3 decimals: base_amount = 1000 means 1.000 SOL
+                #
+                # To achieve target margin:
+                # 1. Calculate target notional = margin * leverage
+                # 2. Convert notional to asset units: asset_amount = notional_usd / asset_price
+                # 3. Convert to base_amount units: base_amount = asset_amount * precision_multiplier
+                
+                target_notional = self.config.base_amount_in_usdt * avg_leverage
+                asset_amount = target_notional / mid_price  # Asset units needed for this notional
+                base_amount = max(1, round(asset_amount * precision_multiplier))  # Convert to precision units
+                
+                # Calculate actual values for logging
+                base_amount_decimal = base_amount / precision_multiplier  # Actual asset amount
+                actual_notional_usd = base_amount_decimal * mid_price  # Dollar value
+                margin_long = actual_notional_usd / effective_leverage_long
+                margin_short = actual_notional_usd / effective_leverage_short
+                
+                logger.info(f"Using BASE_AMOUNT_IN_USDT: ${self.config.base_amount_in_usdt:.2f} (target margin)")
+                logger.info(f"  Asset: {market_symbol.split('-')[0]}, Price: ${mid_price:.2f}")
+                logger.info(f"  Precision: {precision_decimals} decimals (multiplier: {precision_multiplier})")
+                logger.info(f"  Average leverage: {avg_leverage:.1f}x")
+                logger.info(f"  Target notional: ${target_notional:.2f}")
+                logger.info(f"  Asset amount: {base_amount_decimal:.{precision_decimals}f}")
+                logger.info(f"  Actual notional: ${actual_notional_usd:.2f}")
+                logger.info(f"  Long: ${actual_notional_usd:.2f} notional / {effective_leverage_long}x = ${margin_long:.2f} margin")
+                logger.info(f"  Short: ${actual_notional_usd:.2f} notional / {effective_leverage_short}x = ${margin_short:.2f} margin")
+                # Store precision for later display
+                display_precision = precision_decimals
+                display_multiplier = precision_multiplier
             else:
                 base_amount = self.config.base_amount
+                # Default to 4 decimals if not using USDT sizing
+                display_precision = 4
+                display_multiplier = 10000
             
             logger.info(f"Executing delta neutral trade on {market_symbol}:")
-            logger.info(f"  Base amount: {base_amount / 10000:.4f}")
+            logger.info(f"  Base amount: {base_amount / display_multiplier:.{display_precision}f} {market_symbol.split('-')[0]}")
             logger.info(f"  Best Bid: ${best_bid:.2f}, Best Ask: ${best_ask:.2f}")
             logger.info(f"  Spread: ${spread:.2f} ({spread_percentage:.3f}%)")
             logger.info(f"  Long leverage: {leverage_long}x | Short leverage: {leverage_short}x")
