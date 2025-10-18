@@ -68,7 +68,8 @@ class SingleAccountWorker:
             is_ask = order_params['is_ask']
             client_order_index = order_params.get('client_order_index', 0)
             
-            # Execute market order with slippage protection
+            # This function is now deprecated in favor of execute_limit_order
+            # but kept for reference. The orchestrator will no longer call it.
             result = await self.client.create_market_order(
                 market_index=market_index,
                 client_order_index=client_order_index,
@@ -107,6 +108,63 @@ class SingleAccountWorker:
                 'error': str(e),
                 'timestamp': datetime.now().isoformat()
             }
+
+    async def execute_true_market_order(self, order_params: dict) -> dict:
+        """
+        Execute a true market order by providing a worst-case price limit.
+        """
+        try:
+            result = await self.client.create_market_order(
+                market_index=order_params['market_index'],
+                client_order_index=order_params['client_order_index'],
+                base_amount=order_params['base_amount'],
+                avg_execution_price=order_params['execution_price'],
+                is_ask=order_params['is_ask'],
+                reduce_only=order_params.get('reduce_only', False)
+            )
+
+            create_order, resp, error = result
+
+            if error:
+                return {'success': False, 'error': error}
+
+            if resp and resp.code == 200:
+                return {'success': True, 'tx_hash': resp.tx_hash}
+            else:
+                return {'success': False, 'error': f"API Error {resp.code if resp else 'N/A'}: {resp.message if resp else 'No response'}"}
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    async def execute_limit_order(self, order_params: dict) -> dict:
+        """
+        Execute a single limit order. Can be used for opening or closing.
+        """
+        try:
+            # Use IOC to ensure it fills immediately or cancels
+            result = await self.client.create_order(
+                market_index=order_params['market_index'],
+                client_order_index=order_params['client_order_index'],
+                base_amount=order_params['base_amount'],
+                price=order_params['price'],
+                is_ask=order_params['is_ask'],
+                order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
+                time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                reduce_only=order_params.get('reduce_only', False)
+            )
+            
+            create_order, resp, error = result
+            
+            if error:
+                return {'success': False, 'error': error}
+            
+            if resp and resp.code == 200:
+                return {'success': True, 'tx_hash': resp.tx_hash}
+            else:
+                return {'success': False, 'error': f"API Error {resp.code if resp else 'N/A'}: {resp.message if resp else 'No response'}"}
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     async def close_position(self, market_index: int, position_side: str, base_amount: int, price_limit: int) -> dict:
         """
@@ -205,8 +263,16 @@ async def main():
         result = {'success': True, 'message': 'Leverage updated'}
         
     elif command == 'execute_order':
-        # Execute order
+        # DEPRECATED: Use execute_limit_order instead
         result = await worker.execute_order(config['order'])
+
+    elif command == 'execute_limit_order':
+        # Execute a limit order
+        result = await worker.execute_limit_order(config['order'])
+
+    elif command == 'execute_true_market_order':
+        # Execute a true market order
+        result = await worker.execute_true_market_order(config['order'])
         
     elif command == 'close_position':
         # Close position

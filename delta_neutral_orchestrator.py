@@ -40,8 +40,8 @@ class DeltaNeutralOrchestrator:
         self.is_running = False
         self.open_positions = []  # Track open positions for closing
         
-    async def get_current_price(self) -> Optional[float]:
-        """Get current market price from order book"""
+    async def get_current_price(self) -> Optional[Tuple[float, float]]:
+        """Get current best bid and ask from order book"""
         try:
             configuration = lighter.Configuration(self.config.base_url)
             api_client = lighter.ApiClient(configuration)
@@ -57,15 +57,14 @@ class DeltaNeutralOrchestrator:
             if order_book.asks and order_book.bids:
                 best_ask = float(order_book.asks[0].price)
                 best_bid = float(order_book.bids[0].price)
-                mid_price = (best_ask + best_bid) / 2
-                return mid_price
+                return best_bid, best_ask
             else:
                 logger.warning("Order book has no bids or asks")
-                return None
+                return None, None
                 
         except Exception as e:
             logger.error(f"Error fetching current price: {e}")
-            return None
+            return None, None
     
     async def run_worker_command(self, account_config: dict, command_config: dict) -> dict:
         """Run a worker process with given configuration"""
@@ -140,18 +139,27 @@ class DeltaNeutralOrchestrator:
     async def execute_delta_neutral_trade(self) -> Tuple[bool, str]:
         """Execute simultaneous long and short market orders using isolated workers"""
         try:
-            # Get current price
-            current_price = await self.get_current_price()
-            if not current_price:
+            # Get current bid and ask
+            best_bid, best_ask = await self.get_current_price()
+            if not best_bid or not best_ask:
                 return False, "Failed to get current price"
+
+            # --- PRE-TRADE SAFEGUARD: Check Bid-Ask Spread ---
+            spread = best_ask - best_bid
+            spread_percentage = (spread / best_ask) * 100
+            max_spread_percentage = 0.1  # Allow up to 0.1% spread
+
+            if spread_percentage > max_spread_percentage:
+                logger.warning(f"Spread ({spread_percentage:.4f}%) exceeds max ({max_spread_percentage}%) - skipping trade")
+                return False, "Spread too wide"
             
             base_amount = self.config.base_amount
-            long_max_price = int(current_price * (1 + self.config.max_slippage))
-            short_min_price = int(current_price * (1 - self.config.max_slippage))
+            long_max_price = int(best_ask * (1 + self.config.max_slippage))
+            short_min_price = int(best_bid * (1 - self.config.max_slippage))
             
             logger.info(f"Executing delta neutral trade:")
             logger.info(f"  Base amount: {base_amount / 10000:.4f}")
-            logger.info(f"  Current price: ${current_price:.2f}")
+            logger.info(f"  Best Bid: ${best_bid:.2f}, Best Ask: ${best_ask:.2f}")
             logger.info(f"  Long max price: ${long_max_price:.2f}")
             logger.info(f"  Short min price: ${short_min_price:.2f}")
             
@@ -173,25 +181,31 @@ class DeltaNeutralOrchestrator:
             # Prepare order commands
             timestamp_ms = int(datetime.now().timestamp() * 1000)
             
+            # For a true market order, we set a very wide price boundary.
+            # For a buy order, we set a very high price.
+            # For a sell order, we set a very low price (e.g., 1).
+            long_execution_price = 999999999
+            short_execution_price = 1
+
             long_command = {
-                'command': 'execute_order',
+                'command': 'execute_true_market_order',
                 'order': {
                     'market_index': self.config.market_index,
                     'base_amount': base_amount,
-                    'price_limit': long_max_price,
                     'is_ask': False,  # Buy = Long
-                    'client_order_index': timestamp_ms % 1000000
+                    'client_order_index': timestamp_ms % 1000000,
+                    'execution_price': long_execution_price
                 }
             }
             
             short_command = {
-                'command': 'execute_order',
+                'command': 'execute_true_market_order',
                 'order': {
                     'market_index': self.config.market_index,
                     'base_amount': base_amount,
-                    'price_limit': short_min_price,
                     'is_ask': True,  # Sell = Short
-                    'client_order_index': (timestamp_ms + 1) % 1000000
+                    'client_order_index': (timestamp_ms + 1) % 1000000,
+                    'execution_price': short_execution_price
                 }
             }
             
@@ -257,19 +271,21 @@ class DeltaNeutralOrchestrator:
                     else:
                         remaining_positions.append(pos)
                 
-                self.open_positions = remaining_positions
-                
                 # Close positions that are ready
-                for pos in positions_to_close:
-                    logger.info(f"\n{'='*60}")
-                    logger.info(f"Closing positions from Trade #{pos['trade_number']}")
-                    logger.info(f"{'='*60}")
-                    await self.close_position_pair(
-                        pos['market_index'],
-                        pos['base_amount'],
-                        pos['long_price_limit'],
-                        pos['short_price_limit']
-                    )
+                if positions_to_close:
+                    for pos in positions_to_close:
+                        logger.info(f"\n{'='*60}")
+                        logger.info(f"Closing positions from Trade #{pos['trade_number']}")
+                        logger.info(f"{'='*60}")
+                        await self.close_position_pair(
+                            pos['market_index'],
+                            pos['base_amount'],
+                            pos['long_price_limit'],
+                            pos['short_price_limit']
+                        )
+                    
+                    # Only update the list after closing is complete
+                    self.open_positions = remaining_positions
                 
                 await asyncio.sleep(1)  # Check every second
                 
@@ -296,34 +312,43 @@ class DeltaNeutralOrchestrator:
             }
             
             # Get current price for closing
-            current_price = await self.get_current_price()
-            if not current_price:
+            best_bid, best_ask = await self.get_current_price()
+            if not best_bid or not best_ask:
                 logger.warning("Could not get current price for closing, using original limits")
-                close_long_price = long_price_limit
-                close_short_price = short_price_limit
+                close_long_price = short_price_limit # Fallback to original short price limit for selling
+                close_short_price = long_price_limit # Fallback to original long price limit for buying
             else:
-                # Use fresh prices with slippage for closing
-                close_long_price = int(current_price * (1 - self.config.max_slippage))  # Sell lower
-                close_short_price = int(current_price * (1 + self.config.max_slippage))  # Buy higher
-            
-            # Close commands with base_amount and price_limit
+                # To close a long position, we sell at the best bid
+                close_long_price = int(best_bid)
+                # To close a short position, we buy at the best ask
+                close_short_price = int(best_ask)
+
+            # To close positions, we also use true market orders with wide boundaries.
+            close_long_execution_price = 1  # Sell to close long
+            close_short_execution_price = 999999999 # Buy to close short
+
+            # Close commands with base_amount and price
             close_long_command = {
-                'command': 'close_position',
-                'close': {
+                'command': 'execute_true_market_order',
+                'order': {
                     'market_index': market_index,
-                    'position_side': 'long',
                     'base_amount': base_amount,
-                    'price_limit': close_long_price
+                    'is_ask': True, # Sell to close long
+                    'client_order_index': int(datetime.now().timestamp() * 1000 + 2) % 1000000,
+                    'reduce_only': True,
+                    'execution_price': close_long_execution_price
                 }
             }
             
             close_short_command = {
-                'command': 'close_position',
-                'close': {
+                'command': 'execute_true_market_order',
+                'order': {
                     'market_index': market_index,
-                    'position_side': 'short',
                     'base_amount': base_amount,
-                    'price_limit': close_short_price
+                    'is_ask': False, # Buy to close short
+                    'client_order_index': int(datetime.now().timestamp() * 1000 + 3) % 1000000,
+                    'reduce_only': True,
+                    'execution_price': close_short_execution_price
                 }
             }
             
@@ -410,19 +435,19 @@ class DeltaNeutralOrchestrator:
         except KeyboardInterrupt:
             logger.info("\nReceived interrupt signal")
         finally:
-            self.is_running = False
-            
-            # Wait for remaining positions to close
+            # Wait for any remaining open positions to be closed by the background task
             if self.open_positions:
-                logger.info(f"\nWaiting for {len(self.open_positions)} remaining positions to close...")
+                logger.info(f"\nWaiting for {len(self.open_positions)} remaining position(s) to close...")
                 while self.open_positions:
                     await asyncio.sleep(1)
             
+            # Now that all positions are closed, we can stop the background task
+            self.is_running = False
             close_task.cancel()
             try:
                 await close_task
             except asyncio.CancelledError:
-                pass
+                pass  # Expected on cancellation
             
             logger.info("Bot stopped")
 
