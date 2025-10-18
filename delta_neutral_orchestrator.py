@@ -538,9 +538,10 @@ class DeltaNeutralOrchestrator:
                     logger.info(f"\nReached maximum trade limit ({self.config.max_trades})")
                     break
                 
-                # Wait before next trade
-                logger.info(f"Waiting {self.config.interval_seconds}s until next trade...")
-                await asyncio.sleep(self.config.interval_seconds)
+                # Wait before next trade with random delay
+                open_delay = random.randint(self.config.min_open_delay, self.config.max_open_delay)
+                logger.info(f"Waiting {open_delay}s until next trade (range: {self.config.min_open_delay}-{self.config.max_open_delay}s)...")
+                await asyncio.sleep(open_delay)
                 
         except KeyboardInterrupt:
             logger.info("\nReceived interrupt signal")
@@ -607,8 +608,8 @@ async def main():
     else:
         logger.info(f"  Leverage: {config.leverage}x (Fixed)")
     logger.info(f"  Margin Mode: {'Cross' if config.margin_mode == 0 else 'Isolated'}")
-    logger.info(f"  Interval: {config.interval_seconds}s")
-    logger.info(f"  Position Close Delay: {config.min_close_delay}-{config.max_close_delay}s")
+    logger.info(f"  Open New Trade Delay: {config.min_open_delay}-{config.max_open_delay}s (randomized) 🎲")
+    logger.info(f"  Position Close Delay: {config.min_close_delay}-{config.max_close_delay}s (randomized)")
     logger.info(f"  Max Trades: {config.max_trades if config.max_trades > 0 else 'Unlimited'}")
     logger.info(f"  Batch Mode: {config.use_batch_mode}")
     logger.info("")

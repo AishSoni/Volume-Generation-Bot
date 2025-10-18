@@ -38,7 +38,9 @@ class BotConfig:
     margin_mode: int  # 0 = cross margin, 1 = isolated margin
     
     # Bot Behavior
-    interval_seconds: int  # Time between NEW trades
+    interval_seconds: int  # Time between NEW trades (deprecated - use min/max_open_delay)
+    min_open_delay: int  # Minimum seconds before opening new trade
+    max_open_delay: int  # Maximum seconds before opening new trade
     min_close_delay: int  # Minimum seconds before closing position
     max_close_delay: int  # Maximum seconds before closing position
     max_trades: int  # Maximum number of trades (0 = unlimited)
@@ -109,7 +111,9 @@ class BotConfig:
             margin_mode=int(get_optional_env('MARGIN_MODE', '0')),  # Default: cross margin
             
             # Bot Behavior
-            interval_seconds=int(get_optional_env('INTERVAL_SECONDS', '60')),  # Default: 60 seconds
+            interval_seconds=int(get_optional_env('INTERVAL_SECONDS', '60')),  # Deprecated, kept for backwards compatibility
+            min_open_delay=int(get_optional_env('MIN_OPEN_DELAY', '80')),  # Default: 80 seconds
+            max_open_delay=int(get_optional_env('MAX_OPEN_DELAY', '120')),  # Default: 120 seconds
             min_close_delay=int(get_optional_env('MIN_CLOSE_DELAY', '30')),  # Default: 30 seconds
             max_close_delay=int(get_optional_env('MAX_CLOSE_DELAY', '50')),  # Default: 50 seconds
             max_trades=int(get_optional_env('MAX_TRADES', '0')),  # Default: unlimited
@@ -246,11 +250,30 @@ class BotConfig:
         if self.interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
         
+        # Validate open delay ranges
+        if self.min_open_delay < 0 or self.max_open_delay < 0:
+            raise ValueError("open delays must be non-negative")
+        
+        if self.min_open_delay > self.max_open_delay:
+            raise ValueError("min_open_delay must be <= max_open_delay")
+        
+        # Validate close delay ranges
         if self.min_close_delay < 0 or self.max_close_delay < 0:
             raise ValueError("close delays must be non-negative")
         
         if self.min_close_delay > self.max_close_delay:
             raise ValueError("min_close_delay must be <= max_close_delay")
+        
+        # CRITICAL VALIDATION: MIN_OPEN_DELAY must be at least 30 seconds larger than MAX_CLOSE_DELAY
+        # This ensures new trades are only opened after old positions are closed
+        safety_buffer = 30  # seconds
+        if self.min_open_delay < (self.max_close_delay + safety_buffer):
+            raise ValueError(
+                f"MIN_OPEN_DELAY ({self.min_open_delay}s) must be at least {safety_buffer}s larger than "
+                f"MAX_CLOSE_DELAY ({self.max_close_delay}s). "
+                f"Minimum required: {self.max_close_delay + safety_buffer}s. "
+                f"This ensures new trades only open after old positions close."
+            )
         
         if self.max_trades < 0:
             raise ValueError("max_trades must be non-negative")
