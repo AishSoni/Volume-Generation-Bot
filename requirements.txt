@@ -1,0 +1,25 @@
+# Python Dependencies for Delta Neutral Bot
+
+# Core dependencies
+python-dateutil>=2.5.3
+setuptools>=21.0.0
+urllib3>=1.25.3,<2.1.0
+pydantic>=2
+typing-extensions>=4.7.1
+
+# Async HTTP and WebSocket support
+aiohttp>=3.0.0
+aiohttp-retry>=2.8.3
+websockets>=12.0.0
+
+# Ethereum account management
+eth-account>=0.13.4
+
+# HTTP requests
+requests>=2.31.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Logging (optional, but recommended)
+colorlog>=6.7.0
