@@ -48,6 +48,11 @@ class BotConfig:
     max_trades: int
     use_batch_mode: bool
     
+    # Mixed Order Strategy
+    limit_order_probability: float
+    limit_order_wait_time: int
+    limit_order_retry_adjustment: float
+    
     @classmethod
     def from_env(cls) -> 'BotConfig':
         """Load configuration from environment variables"""
@@ -106,6 +111,9 @@ class BotConfig:
             max_close_delay=int(get_optional_env('MAX_CLOSE_DELAY', '50')),
             max_trades=int(get_optional_env('MAX_TRADES', '0')),
             use_batch_mode=get_optional_env('USE_BATCH_MODE', 'false').lower() == 'true',
+            limit_order_probability=float(get_optional_env('LIMIT_ORDER_PROBABILITY', '0.8')),
+            limit_order_wait_time=int(get_optional_env('LIMIT_ORDER_WAIT_TIME', '90')),
+            limit_order_retry_adjustment=float(get_optional_env('LIMIT_ORDER_RETRY_ADJUSTMENT', '0.0002')),
         )
     
     async def get_market_max_leverage(self, market_id: Optional[int] = None) -> int:

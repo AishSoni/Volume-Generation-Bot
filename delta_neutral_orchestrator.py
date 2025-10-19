@@ -273,10 +273,13 @@ class DeltaNeutralOrchestrator:
         return True
     
     async def execute_delta_neutral_trade(self) -> Tuple[bool, str]:
-        """Execute simultaneous long and short market orders using isolated workers"""
+        """Execute simultaneous long and short orders using mixed order strategy (80% limit, 20% market)"""
         try:
             # Randomly select a market from the whitelist
             selected_market = self.select_random_market()
+            
+            # Decide order type for this trade pair (same for both long and short)
+            use_limit_order = random.random() < self.config.limit_order_probability
             
             # Get market info and determine leverage for this trade
             try:
@@ -302,6 +305,11 @@ class DeltaNeutralOrchestrator:
                 leverage_long = self.config.leverage
                 leverage_short = self.config.leverage
                 logger.info(f"📊 Selected market: {market_symbol} (ID: {selected_market})")
+            
+            # Log order type
+            order_type_emoji = "📝" if use_limit_order else "⚡"
+            order_type_name = "LIMIT" if use_limit_order else "MARKET"
+            logger.info(f"{order_type_emoji} Order Type: {order_type_name} ({self.config.limit_order_probability*100:.0f}% limit probability)")
             
             # Update leverage for each account independently (if dynamic mode)
             if self.config.use_dynamic_leverage:
@@ -395,36 +403,68 @@ class DeltaNeutralOrchestrator:
                 'api_key_index': self.config.account2_api_key_index,
             }
             
-            # Prepare order commands
+            # Prepare order commands based on order type
             timestamp_ms = int(datetime.now().timestamp() * 1000)
             
-            # For a true market order, we set a very wide price boundary.
-            # For a buy order, we set a very high price.
-            # For a sell order, we set a very low price (e.g., 1).
-            long_execution_price = 999999999
-            short_execution_price = 1
+            if use_limit_order:
+                # Use limit orders at mid-price to earn the spread
+                mid_price = (best_bid + best_ask) / 2
+                
+                # For opening: place limit orders at mid-price
+                long_limit_price = mid_price
+                short_limit_price = mid_price
+                
+                logger.info(f"  📝 Placing LIMIT orders at mid-price: ${mid_price:.2f}")
+                
+                long_command = {
+                    'command': 'execute_limit_order',
+                    'order': {
+                        'market_index': selected_market,
+                        'base_amount': base_amount,
+                        'is_ask': False,  # Buy = Long
+                        'client_order_index': timestamp_ms % 1000000,
+                        'limit_price': long_limit_price
+                    }
+                }
+                
+                short_command = {
+                    'command': 'execute_limit_order',
+                    'order': {
+                        'market_index': selected_market,
+                        'base_amount': base_amount,
+                        'is_ask': True,  # Sell = Short
+                        'client_order_index': (timestamp_ms + 1) % 1000000,
+                        'limit_price': short_limit_price
+                    }
+                }
+            else:
+                # Use market orders with worst-case prices
+                long_execution_price = 999999999
+                short_execution_price = 1
+                
+                logger.info(f"  ⚡ Placing MARKET orders")
 
-            long_command = {
-                'command': 'execute_true_market_order',
-                'order': {
-                    'market_index': selected_market,
-                    'base_amount': base_amount,
-                    'is_ask': False,  # Buy = Long
-                    'client_order_index': timestamp_ms % 1000000,
-                    'execution_price': long_execution_price
+                long_command = {
+                    'command': 'execute_true_market_order',
+                    'order': {
+                        'market_index': selected_market,
+                        'base_amount': base_amount,
+                        'is_ask': False,  # Buy = Long
+                        'client_order_index': timestamp_ms % 1000000,
+                        'execution_price': long_execution_price
+                    }
                 }
-            }
-            
-            short_command = {
-                'command': 'execute_true_market_order',
-                'order': {
-                    'market_index': selected_market,
-                    'base_amount': base_amount,
-                    'is_ask': True,  # Sell = Short
-                    'client_order_index': (timestamp_ms + 1) % 1000000,
-                    'execution_price': short_execution_price
+                
+                short_command = {
+                    'command': 'execute_true_market_order',
+                    'order': {
+                        'market_index': selected_market,
+                        'base_amount': base_amount,
+                        'is_ask': True,  # Sell = Short
+                        'client_order_index': (timestamp_ms + 1) % 1000000,
+                        'execution_price': short_execution_price
+                    }
                 }
-            }
             
             # Execute both orders in parallel using isolated workers
             results = await asyncio.gather(
@@ -439,15 +479,123 @@ class DeltaNeutralOrchestrator:
             long_success = isinstance(long_result, dict) and long_result.get('success', False)
             short_success = isinstance(short_result, dict) and short_result.get('success', False)
             
-            if long_success:
-                logger.info(f"✅ Long order (Account 1): TX {long_result.get('tx_hash', 'N/A')[:16]}...")
-            else:
-                logger.error(f"❌ Long order failed: {long_result.get('error', 'Unknown error') if isinstance(long_result, dict) else str(long_result)}")
+            # If using limit orders, wait for fill confirmation
+            if use_limit_order and long_success and short_success:
+                logger.info(f"✅ Limit orders placed successfully")
+                logger.info(f"   Waiting {self.config.limit_order_wait_time}s for orders to fill...")
+                
+                # Extract order IDs
+                long_order_id = long_result.get('order_id')
+                short_order_id = short_result.get('order_id')
+                
+                # Wait for specified time
+                await asyncio.sleep(self.config.limit_order_wait_time)
+                
+                # Check fill status
+                fill_check_long = await self.run_worker_command(account1_config, {
+                    'command': 'get_order_status',
+                    'order': {
+                        'market_index': selected_market,
+                        'order_id': long_order_id
+                    }
+                })
+                
+                fill_check_short = await self.run_worker_command(account2_config, {
+                    'command': 'get_order_status',
+                    'order': {
+                        'market_index': selected_market,
+                        'order_id': short_order_id
+                    }
+                })
+                
+                long_filled = fill_check_long.get('filled', False)
+                short_filled = fill_check_short.get('filled', False)
+                
+                # Handle unfilled orders
+                if not long_filled or not short_filled:
+                    logger.warning(f"⏱️  Orders not filled after {self.config.limit_order_wait_time}s")
+                    logger.info(f"   Long filled: {long_filled}, Short filled: {short_filled}")
+                    
+                    # Cancel unfilled orders
+                    if not long_filled:
+                        await self.run_worker_command(account1_config, {
+                            'command': 'cancel_order',
+                            'order': {'market_index': selected_market, 'order_id': long_order_id}
+                        })
+                    
+                    if not short_filled:
+                        await self.run_worker_command(account2_config, {
+                            'command': 'cancel_order',
+                            'order': {'market_index': selected_market, 'order_id': short_order_id}
+                        })
+                    
+                    # Retry with adjusted prices (closer to market)
+                    logger.info(f"🔄 Retrying with adjusted prices (tighter to market)...")
+                    
+                    # Get fresh prices
+                    best_bid, best_ask = await self.get_current_price(selected_market)
+                    if not best_bid or not best_ask:
+                        return False, f"Failed to get price for retry"
+                    
+                    # Adjust prices to be more aggressive (closer to market)
+                    spread_adjustment = best_ask - best_bid
+                    retry_long_price = best_ask - (spread_adjustment * self.config.limit_order_retry_adjustment)
+                    retry_short_price = best_bid + (spread_adjustment * self.config.limit_order_retry_adjustment)
+                    
+                    logger.info(f"   Retry prices: Long ${retry_long_price:.2f}, Short ${retry_short_price:.2f}")
+                    
+                    # Retry only unfilled orders
+                    retry_results = []
+                    if not long_filled:
+                        retry_long_cmd = {
+                            'command': 'execute_limit_order',
+                            'order': {
+                                'market_index': selected_market,
+                                'base_amount': base_amount,
+                                'is_ask': False,
+                                'client_order_index': (timestamp_ms + 10) % 1000000,
+                                'limit_price': retry_long_price
+                            }
+                        }
+                        retry_results.append(self.run_worker_command(account1_config, retry_long_cmd))
+                    
+                    if not short_filled:
+                        retry_short_cmd = {
+                            'command': 'execute_limit_order',
+                            'order': {
+                                'market_index': selected_market,
+                                'base_amount': base_amount,
+                                'is_ask': True,
+                                'client_order_index': (timestamp_ms + 11) % 1000000,
+                                'limit_price': retry_short_price
+                            }
+                        }
+                        retry_results.append(self.run_worker_command(account2_config, retry_short_cmd))
+                    
+                    if retry_results:
+                        retry_outcomes = await asyncio.gather(*retry_results, return_exceptions=True)
+                        
+                        # Wait shorter time for retry
+                        await asyncio.sleep(self.config.limit_order_wait_time // 2)
+                        
+                        # If still not filled after retry, skip this trade
+                        logger.warning(f"⚠️  Limit orders partially/not filled after retry - skipping trade")
+                        # Note: Any filled orders will need to be closed in next cycle
+                        return False, f"Limit orders not filled for {market_symbol}"
+                
+                logger.info(f"✅ Both limit orders filled successfully!")
             
-            if short_success:
-                logger.info(f"✅ Short order (Account 2): TX {short_result.get('tx_hash', 'N/A')[:16]}...")
-            else:
-                logger.error(f"❌ Short order failed: {short_result.get('error', 'Unknown error') if isinstance(short_result, dict) else str(short_result)}")
+            # For market orders, log immediately
+            if not use_limit_order:
+                if long_success:
+                    logger.info(f"✅ Long order (Account 1): TX {long_result.get('tx_hash', 'N/A')[:16]}...")
+                else:
+                    logger.error(f"❌ Long order failed: {long_result.get('error', 'Unknown error') if isinstance(long_result, dict) else str(long_result)}")
+                
+                if short_success:
+                    logger.info(f"✅ Short order (Account 2): TX {short_result.get('tx_hash', 'N/A')[:16]}...")
+                else:
+                    logger.error(f"❌ Short order failed: {short_result.get('error', 'Unknown error') if isinstance(short_result, dict) else str(short_result)}")
             
             # Both must succeed for delta neutral
             if long_success and short_success:

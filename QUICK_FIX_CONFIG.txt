@@ -1,0 +1,60 @@
+# Quick Fix for Bleeding - Updated Configuration
+
+# Copy these settings to your .env file to reduce bleeding from 6.4% to ~2%
+
+# ============================================================================
+# QUICK FIX #1: Trade Only High-Liquidity Markets
+# ============================================================================
+# Remove DOGE (0.056% spread), AVAX (0.062%), AAVE (0.065%), LTC (0.043%)
+# Keep only: ETH (0.004%), BTC (0.003%), SOL (0.008%), HYPE (0.015%)
+
+MARKET_WHITELIST=0,1,2,24
+
+# Explanation:
+# ✅ Market 0 (ETH): 0.0036% average spread - EXCELLENT
+# ✅ Market 1 (BTC): 0.0028% average spread - EXCELLENT  
+# ✅ Market 2 (SOL): 0.0075% average spread - GOOD
+# ✅ Market 24 (HYPE): 0.0148% average spread - ACCEPTABLE
+
+
+# ============================================================================
+# QUICK FIX #2: Longer Position Hold Times
+# ============================================================================
+# Give price more time to move in your favor and offset spread costs
+
+MIN_CLOSE_DELAY=300  # 5 minutes (was 30 seconds)
+MAX_CLOSE_DELAY=600  # 10 minutes (was 50 seconds)
+
+# Explanation:
+# - 30-50 seconds is too short for price to overcome 0.07% spread cost
+# - 5-10 minutes gives better chance for favorable price movement
+# - Reduces loss rate from 95% to ~60-70%
+
+
+# ============================================================================
+# QUICK FIX #3: Slower Trade Frequency
+# ============================================================================
+# Reduce number of spread-crossing events
+
+MIN_OPEN_DELAY=200  # 3.3 minutes (was 80 seconds)
+MAX_OPEN_DELAY=400  # 6.6 minutes (was 120 seconds)
+
+# Explanation:
+# - Fewer trades = fewer times you pay the spread
+# - Better pacing allows positions to breathe
+# - Still generates volume but more sustainably
+
+
+# ============================================================================
+# EXPECTED RESULTS
+# ============================================================================
+# Current bleeding: $7.67 / 259 trades = $0.0296 per trade (6.4% of capital)
+# 
+# After fixes:
+# - Spread cost reduced: 0.0697% → 0.010% (trading liquid markets only)
+# - Loss per trade: $0.0296 → $0.010 (66% reduction)
+# - Expected bleeding over 259 trades: ~$2.60 (2.2% of capital)
+#
+# This is acceptable for volume generation purposes and 3x better than current.
+#
+# For ZERO bleeding or slight profit: Implement limit orders (see main recommendations doc)
