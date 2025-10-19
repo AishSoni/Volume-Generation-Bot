@@ -82,14 +82,17 @@ class SingleAccountWorker:
             Dictionary with success status, order_id, tx_hash or error message
         """
         try:
-            result = await self.client.create_limit_order(
+            # Use create_order with limit order parameters
+            result = await self.client.create_order(
                 market_index=order_params['market_index'],
                 client_order_index=order_params['client_order_index'],
                 base_amount=order_params['base_amount'],
-                price_limit=order_params['limit_price'],
+                price=order_params['limit_price'],  # Use 'price' not 'price_limit'
                 is_ask=order_params['is_ask'],
-                post_only=True,  # Critical: ensures we're a maker, not taker
-                reduce_only=order_params.get('reduce_only', False)
+                order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,  # Limit order type
+                time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,  # Post-only ensures maker
+                reduce_only=order_params.get('reduce_only', False),
+                order_expiry=lighter.SignerClient.DEFAULT_28_DAY_ORDER_EXPIRY  # Standard expiry for limit orders
             )
 
             create_order, resp, error = result
@@ -98,10 +101,11 @@ class SingleAccountWorker:
                 return {'success': False, 'error': error}
 
             if resp and resp.code == 200:
+                # For limit orders, the order_id is the client_order_index we provided
                 return {
                     'success': True, 
                     'tx_hash': resp.tx_hash,
-                    'order_id': create_order.order_id if create_order else None
+                    'order_id': order_params['client_order_index']  # Return the client_order_index as order_id
                 }
             
             error_msg = f"API Error {resp.code if resp else 'N/A'}"
@@ -123,9 +127,10 @@ class SingleAccountWorker:
             Dictionary with success status
         """
         try:
-            result = await self.client.cancel_limit_order(
+            # Use cancel_order with order_index (SDK uses order_index not order_id)
+            result = await self.client.cancel_order(
                 market_index=order_params['market_index'],
-                order_id=order_params['order_id']
+                order_index=order_params['order_id']  # SDK parameter is order_index
             )
             
             _, resp, error = result

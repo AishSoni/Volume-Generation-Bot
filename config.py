@@ -52,6 +52,7 @@ class BotConfig:
     limit_order_probability: float
     limit_order_wait_time: int
     limit_order_retry_adjustment: float
+    limit_order_max_retries: int
     
     @classmethod
     def from_env(cls) -> 'BotConfig':
@@ -114,6 +115,7 @@ class BotConfig:
             limit_order_probability=float(get_optional_env('LIMIT_ORDER_PROBABILITY', '0.8')),
             limit_order_wait_time=int(get_optional_env('LIMIT_ORDER_WAIT_TIME', '90')),
             limit_order_retry_adjustment=float(get_optional_env('LIMIT_ORDER_RETRY_ADJUSTMENT', '0.0002')),
+            limit_order_max_retries=int(get_optional_env('LIMIT_ORDER_MAX_RETRIES', '1')),
         )
     
     async def get_market_max_leverage(self, market_id: Optional[int] = None) -> int:

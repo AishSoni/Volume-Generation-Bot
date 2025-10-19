@@ -61,7 +61,7 @@ class DeltaNeutralOrchestrator:
             fallback_price: Price to use for fallback precision guess
             
         Returns:
-            Number of decimal places for base amount
+            Tuple of (size_decimals, price_decimals)
         """
         try:
             configuration = lighter.Configuration(self.config.base_url)
@@ -74,15 +74,15 @@ class DeltaNeutralOrchestrator:
             if order_book_details.order_book_details:
                 for detail in order_book_details.order_book_details:
                     if detail.market_id == market_id:
-                        return detail.size_decimals
+                        return detail.size_decimals, detail.price_decimals
             
             # Fallback if not found
-            logger.warning(f"Could not find size_decimals for market {market_id}, using fallback")
-            return self._fallback_precision(fallback_price)
+            logger.warning(f"Could not find decimals for market {market_id}, using fallback")
+            return self._fallback_precision(fallback_price), 2  # Assume 2 price decimals as fallback
             
         except Exception as e:
             logger.warning(f"Error fetching market precision: {e}, using fallback")
-            return self._fallback_precision(fallback_price)
+            return self._fallback_precision(fallback_price), 2
     
     def _fallback_precision(self, price: float) -> int:
         """
@@ -349,8 +349,9 @@ class DeltaNeutralOrchestrator:
                 avg_leverage = (effective_leverage_long + effective_leverage_short) / 2
                 
                 # Fetch official precision from Lighter API
-                precision_decimals = await self._get_market_precision(selected_market, mid_price)
+                precision_decimals, price_decimals = await self._get_market_precision(selected_market, mid_price)
                 precision_multiplier = 10 ** precision_decimals
+                price_multiplier = 10 ** price_decimals
                 
                 # Calculate base_amount from margin target
                 # Formula: base_amount = (margin * leverage / price) * precision_multiplier
@@ -407,14 +408,29 @@ class DeltaNeutralOrchestrator:
             timestamp_ms = int(datetime.now().timestamp() * 1000)
             
             if use_limit_order:
-                # Use limit orders at mid-price to earn the spread
-                mid_price = (best_bid + best_ask) / 2
+                # Use limit orders INSIDE the spread to avoid crossing (post-only requirement)
+                # Long (buy): Must be BELOW best ask
+                # Short (sell): Must be ABOVE best bid
+                spread = best_ask - best_bid
                 
-                # For opening: place limit orders at mid-price
-                long_limit_price = mid_price
-                short_limit_price = mid_price
+                # Place orders slightly inside the spread (90% towards mid from edges)
+                # This ensures we don't cross while still being competitive
+                spread_position = 0.4  # 40% into spread from each side
                 
-                logger.info(f"  📝 Placing LIMIT orders at mid-price: ${mid_price:.2f}")
+                long_limit_price_float = best_bid + (spread * spread_position)
+                short_limit_price_float = best_ask - (spread * spread_position)
+                
+                # Get price decimals for proper integer conversion
+                _, price_decimals = await self._get_market_precision(selected_market, long_limit_price_float)
+                price_multiplier = 10 ** price_decimals
+                
+                # Convert float prices to integers as required by SDK
+                long_limit_price = int(long_limit_price_float * price_multiplier)
+                short_limit_price = int(short_limit_price_float * price_multiplier)
+                
+                logger.info(f"  📝 Placing LIMIT orders inside spread:")
+                logger.info(f"     Long (buy) at ${long_limit_price_float:.4f} (int: {long_limit_price}) [Below ask: ${best_ask:.4f}]")
+                logger.info(f"     Short (sell) at ${short_limit_price_float:.4f} (int: {short_limit_price}) [Above bid: ${best_bid:.4f}]")
                 
                 long_command = {
                     'command': 'execute_limit_order',
@@ -479,6 +495,15 @@ class DeltaNeutralOrchestrator:
             long_success = isinstance(long_result, dict) and long_result.get('success', False)
             short_success = isinstance(short_result, dict) and short_result.get('success', False)
             
+            # Log any errors from limit order placement
+            if use_limit_order:
+                if not long_success:
+                    error_msg = long_result.get('error', 'Unknown error') if isinstance(long_result, dict) else str(long_result)
+                    logger.error(f"❌ Long limit order placement failed: {error_msg}")
+                if not short_success:
+                    error_msg = short_result.get('error', 'Unknown error') if isinstance(short_result, dict) else str(short_result)
+                    logger.error(f"❌ Short limit order placement failed: {error_msg}")
+            
             # If using limit orders, wait for fill confirmation
             if use_limit_order and long_success and short_success:
                 logger.info(f"✅ Limit orders placed successfully")
@@ -511,79 +536,370 @@ class DeltaNeutralOrchestrator:
                 long_filled = fill_check_long.get('filled', False)
                 short_filled = fill_check_short.get('filled', False)
                 
-                # Handle unfilled orders
-                if not long_filled or not short_filled:
-                    logger.warning(f"⏱️  Orders not filled after {self.config.limit_order_wait_time}s")
-                    logger.info(f"   Long filled: {long_filled}, Short filled: {short_filled}")
+                # CASE 1: Both orders filled - Success!
+                if long_filled and short_filled:
+                    logger.info(f"✅ Both limit orders filled successfully!")
+                    # long_success and short_success already True, will proceed to create positions
+                
+                # CASE 2: Both orders unfilled - Retry up to max_retries times with adjusted prices
+                elif not long_filled and not short_filled:
+                    logger.warning(f"⏱️  Both orders unfilled after {self.config.limit_order_wait_time}s")
                     
-                    # Cancel unfilled orders
-                    if not long_filled:
-                        await self.run_worker_command(account1_config, {
-                            'command': 'cancel_order',
-                            'order': {'market_index': selected_market, 'order_id': long_order_id}
-                        })
+                    # Cancel both unfilled orders
+                    await self.run_worker_command(account1_config, {
+                        'command': 'cancel_order',
+                        'order': {'market_index': selected_market, 'order_id': long_order_id}
+                    })
+                    await self.run_worker_command(account2_config, {
+                        'command': 'cancel_order',
+                        'order': {'market_index': selected_market, 'order_id': short_order_id}
+                    })
                     
-                    if not short_filled:
-                        await self.run_worker_command(account2_config, {
-                            'command': 'cancel_order',
-                            'order': {'market_index': selected_market, 'order_id': short_order_id}
-                        })
-                    
-                    # Retry with adjusted prices (closer to market)
-                    logger.info(f"🔄 Retrying with adjusted prices (tighter to market)...")
-                    
-                    # Get fresh prices
-                    best_bid, best_ask = await self.get_current_price(selected_market)
-                    if not best_bid or not best_ask:
-                        return False, f"Failed to get price for retry"
-                    
-                    # Adjust prices to be more aggressive (closer to market)
-                    spread_adjustment = best_ask - best_bid
-                    retry_long_price = best_ask - (spread_adjustment * self.config.limit_order_retry_adjustment)
-                    retry_short_price = best_bid + (spread_adjustment * self.config.limit_order_retry_adjustment)
-                    
-                    logger.info(f"   Retry prices: Long ${retry_long_price:.2f}, Short ${retry_short_price:.2f}")
-                    
-                    # Retry only unfilled orders
-                    retry_results = []
-                    if not long_filled:
+                    # Retry loop
+                    retry_success = False
+                    for retry_attempt in range(1, self.config.limit_order_max_retries + 1):
+                        logger.info(f"🔄 Retry attempt {retry_attempt}/{self.config.limit_order_max_retries} with adjusted prices...")
+                        
+                        # Get fresh prices
+                        best_bid, best_ask = await self.get_current_price(selected_market)
+                        if not best_bid or not best_ask:
+                            return False, f"Failed to get price for retry"
+                        
+                        # Get price decimals for integer conversion
+                        _, price_decimals = await self._get_market_precision(selected_market, best_ask)
+                        price_multiplier = 10 ** price_decimals
+                        
+                        # Adjust prices to be more aggressive but still inside spread
+                        # Move closer to mid-price for faster fill while maintaining post-only
+                        spread = best_ask - best_bid
+                        spread_adjustment_pct = self.config.limit_order_retry_adjustment
+                        
+                        # Each retry moves progressively closer to mid (40% → 45% → 47.5% etc.)
+                        # Formula: 0.4 + (spread_adjustment_pct * 0.25 * retry_attempt)
+                        retry_position = 0.4 + (spread_adjustment_pct * 0.25 * retry_attempt)
+                        retry_long_price_float = best_bid + (spread * retry_position)
+                        retry_short_price_float = best_ask - (spread * retry_position)
+                        
+                        # Ensure we never cross the book
+                        retry_long_price_float = min(retry_long_price_float, best_ask - (spread * 0.01))  # At least 1% below ask
+                        retry_short_price_float = max(retry_short_price_float, best_bid + (spread * 0.01))  # At least 1% above bid
+                        
+                        retry_long_price = int(retry_long_price_float * price_multiplier)
+                        retry_short_price = int(retry_short_price_float * price_multiplier)
+                        
+                        logger.info(f"   Market: Bid ${best_bid:.2f}, Ask ${best_ask:.2f}")
+                        logger.info(f"   Retry prices: Long ${retry_long_price_float:.4f}, Short ${retry_short_price_float:.4f}")
+                        
+                        # Generate unique order IDs for this retry attempt
+                        retry_long_order_id = (timestamp_ms + 10 + (retry_attempt * 2)) % 1000000
+                        retry_short_order_id = (timestamp_ms + 11 + (retry_attempt * 2)) % 1000000
+                        
+                        # Place retry orders
                         retry_long_cmd = {
                             'command': 'execute_limit_order',
                             'order': {
                                 'market_index': selected_market,
                                 'base_amount': base_amount,
                                 'is_ask': False,
-                                'client_order_index': (timestamp_ms + 10) % 1000000,
+                                'client_order_index': retry_long_order_id,
                                 'limit_price': retry_long_price
                             }
                         }
-                        retry_results.append(self.run_worker_command(account1_config, retry_long_cmd))
-                    
-                    if not short_filled:
                         retry_short_cmd = {
                             'command': 'execute_limit_order',
                             'order': {
                                 'market_index': selected_market,
                                 'base_amount': base_amount,
                                 'is_ask': True,
-                                'client_order_index': (timestamp_ms + 11) % 1000000,
+                                'client_order_index': retry_short_order_id,
                                 'limit_price': retry_short_price
                             }
                         }
-                        retry_results.append(self.run_worker_command(account2_config, retry_short_cmd))
+                        
+                        retry_results = await asyncio.gather(
+                            self.run_worker_command(account1_config, retry_long_cmd),
+                            self.run_worker_command(account2_config, retry_short_cmd),
+                            return_exceptions=True
+                        )
+                        
+                        # Check if retry orders placed successfully
+                        if any(isinstance(r, Exception) or not r.get('success', False) for r in retry_results):
+                            logger.error(f"❌ Retry {retry_attempt} order placement failed - skipping trade")
+                            return False, f"Retry orders failed to place for {market_symbol}"
+                        
+                        # Wait for retry orders to fill (same wait time for consistency)
+                        logger.info(f"   Waiting {self.config.limit_order_wait_time}s for retry orders to fill...")
+                        await asyncio.sleep(self.config.limit_order_wait_time)
+                        
+                        # Check if retry orders filled
+                        retry_long_check = await self.run_worker_command(account1_config, {
+                            'command': 'get_order_status',
+                            'order': {'market_index': selected_market, 'order_id': retry_long_order_id}
+                        })
+                        retry_short_check = await self.run_worker_command(account2_config, {
+                            'command': 'get_order_status',
+                            'order': {'market_index': selected_market, 'order_id': retry_short_order_id}
+                        })
+                        
+                        retry_long_filled = retry_long_check.get('filled', False)
+                        retry_short_filled = retry_short_check.get('filled', False)
+                        
+                        # CASE 2a: Both retry orders filled - Success!
+                        if retry_long_filled and retry_short_filled:
+                            logger.info(f"✅ Both retry orders filled on attempt {retry_attempt}!")
+                            retry_success = True
+                            break
+                        
+                        # CASE 2b: Both retry orders still unfilled - Continue to next retry or give up
+                        elif not retry_long_filled and not retry_short_filled:
+                            logger.warning(f"⚠️  Both retry orders unfilled on attempt {retry_attempt}")
+                            # Cancel these retry orders before next attempt
+                            await self.run_worker_command(account1_config, {
+                                'command': 'cancel_order',
+                                'order': {'market_index': selected_market, 'order_id': retry_long_order_id}
+                            })
+                            await self.run_worker_command(account2_config, {
+                                'command': 'cancel_order',
+                                'order': {'market_index': selected_market, 'order_id': retry_short_order_id}
+                            })
+                            # Continue to next retry attempt (or give up if this was the last)
+                        
+                        # CASE 2c: One retry filled, other not - Close filled position and give up
+                        else:
+                            logger.warning(f"⚠️  Asymmetric fill after retry {retry_attempt} (Long: {retry_long_filled}, Short: {retry_short_filled})")
+                            
+                            if retry_long_filled:
+                                logger.warning(f"⚠️  Closing filled long position...")
+                                await self.run_worker_command(account2_config, {
+                                    'command': 'cancel_order',
+                                    'order': {'market_index': selected_market, 'order_id': retry_short_order_id}
+                                })
+                                await self.run_worker_command(account1_config, {
+                                    'command': 'execute_true_market_order',
+                                    'order': {
+                                        'market_index': selected_market,
+                                        'base_amount': base_amount,
+                                        'is_ask': True,
+                                        'client_order_index': (timestamp_ms + 20 + retry_attempt) % 1000000,
+                                        'execution_price': 1,
+                                        'reduce_only': True
+                                    }
+                                })
+                            else:
+                                logger.warning(f"⚠️  Closing filled short position...")
+                                await self.run_worker_command(account1_config, {
+                                    'command': 'cancel_order',
+                                    'order': {'market_index': selected_market, 'order_id': retry_long_order_id}
+                                })
+                                await self.run_worker_command(account2_config, {
+                                    'command': 'execute_true_market_order',
+                                    'order': {
+                                        'market_index': selected_market,
+                                        'base_amount': base_amount,
+                                        'is_ask': False,
+                                        'client_order_index': (timestamp_ms + 21 + retry_attempt) % 1000000,
+                                        'execution_price': 999999999,
+                                        'reduce_only': True
+                                    }
+                                })
+                            
+                            return False, f"Asymmetric fill after retry {retry_attempt} for {market_symbol}"
                     
-                    if retry_results:
-                        retry_outcomes = await asyncio.gather(*retry_results, return_exceptions=True)
-                        
-                        # Wait shorter time for retry
-                        await asyncio.sleep(self.config.limit_order_wait_time // 2)
-                        
-                        # If still not filled after retry, skip this trade
-                        logger.warning(f"⚠️  Limit orders partially/not filled after retry - skipping trade")
-                        # Note: Any filled orders will need to be closed in next cycle
-                        return False, f"Limit orders not filled for {market_symbol}"
+                    # After all retries
+                    if not retry_success:
+                        logger.warning(f"⚠️  All {self.config.limit_order_max_retries} retry attempts exhausted - giving up on this trade")
+                        return False, f"Limit orders unfilled after {self.config.limit_order_max_retries} retries for {market_symbol}"
+                    
+                    # If we got here with retry_success=True, keep long_success and short_success True
                 
-                logger.info(f"✅ Both limit orders filled successfully!")
+                # CASE 3: One side filled, other not - Close filled IMMEDIATELY then retry both
+                else:
+                    logger.warning(f"⚠️  Asymmetric fill detected (Long: {long_filled}, Short: {short_filled})")
+                    
+                    # Determine which side filled and close it immediately
+                    if long_filled:
+                        logger.warning(f"⚠️  Long filled but short unfilled - closing long position immediately")
+                        
+                        # Cancel unfilled short order
+                        await self.run_worker_command(account2_config, {
+                            'command': 'cancel_order',
+                            'order': {'market_index': selected_market, 'order_id': short_order_id}
+                        })
+                        
+                        # Close filled long position with market order
+                        close_result = await self.run_worker_command(account1_config, {
+                            'command': 'execute_true_market_order',
+                            'order': {
+                                'market_index': selected_market,
+                                'base_amount': base_amount,
+                                'is_ask': True,  # Sell to close long
+                                'client_order_index': (timestamp_ms + 20) % 1000000,
+                                'execution_price': 1,
+                                'reduce_only': True
+                            }
+                        })
+                        
+                        if not close_result.get('success'):
+                            logger.error(f"❌ CRITICAL: Failed to close long position: {close_result.get('error')}")
+                        else:
+                            logger.info(f"   ✅ Long position closed")
+                    
+                    else:  # short filled, long not
+                        logger.warning(f"⚠️  Short filled but long unfilled - closing short position immediately")
+                        
+                        # Cancel unfilled long order
+                        await self.run_worker_command(account1_config, {
+                            'command': 'cancel_order',
+                            'order': {'market_index': selected_market, 'order_id': long_order_id}
+                        })
+                        
+                        # Close filled short position with market order
+                        close_result = await self.run_worker_command(account2_config, {
+                            'command': 'execute_true_market_order',
+                            'order': {
+                                'market_index': selected_market,
+                                'base_amount': base_amount,
+                                'is_ask': False,  # Buy to close short
+                                'client_order_index': (timestamp_ms + 21) % 1000000,
+                                'execution_price': 999999999,
+                                'reduce_only': True
+                            }
+                        })
+                        
+                        if not close_result.get('success'):
+                            logger.error(f"❌ CRITICAL: Failed to close short position: {close_result.get('error')}")
+                        else:
+                            logger.info(f"   ✅ Short position closed")
+                    
+                    # Now retry BOTH orders with adjusted prices (fresh start)
+                    logger.info(f"🔄 Retrying both orders with adjusted prices after closing asymmetric position...")
+                    
+                    # Get fresh prices
+                    best_bid, best_ask = await self.get_current_price(selected_market)
+                    if not best_bid or not best_ask:
+                        return False, f"Failed to get price for retry after asymmetric close"
+                    
+                    # Get price decimals
+                    _, price_decimals = await self._get_market_precision(selected_market, best_ask)
+                    price_multiplier = 10 ** price_decimals
+                    
+                    # Adjust prices to be more aggressive but still inside spread
+                    spread = best_ask - best_bid
+                    spread_adjustment_pct = self.config.limit_order_retry_adjustment
+                    
+                    # Retry: Move deeper into spread for faster fill
+                    retry_long_price_float = best_bid + (spread * (0.4 + spread_adjustment_pct * 0.25))
+                    retry_short_price_float = best_ask - (spread * (0.4 + spread_adjustment_pct * 0.25))
+                    
+                    # Ensure we never cross the book
+                    retry_long_price_float = min(retry_long_price_float, best_ask - (spread * 0.01))
+                    retry_short_price_float = max(retry_short_price_float, best_bid + (spread * 0.01))
+                    
+                    retry_long_price = int(retry_long_price_float * price_multiplier)
+                    retry_short_price = int(retry_short_price_float * price_multiplier)
+                    
+                    logger.info(f"   Market: Bid ${best_bid:.2f}, Ask ${best_ask:.2f}")
+                    logger.info(f"   Retry prices: Long ${retry_long_price_float:.4f}, Short ${retry_short_price_float:.4f}")
+                    
+                    # Place both retry orders
+                    retry_long_cmd = {
+                        'command': 'execute_limit_order',
+                        'order': {
+                            'market_index': selected_market,
+                            'base_amount': base_amount,
+                            'is_ask': False,
+                            'client_order_index': (timestamp_ms + 30) % 1000000,
+                            'limit_price': retry_long_price
+                        }
+                    }
+                    retry_short_cmd = {
+                        'command': 'execute_limit_order',
+                        'order': {
+                            'market_index': selected_market,
+                            'base_amount': base_amount,
+                            'is_ask': True,
+                            'client_order_index': (timestamp_ms + 31) % 1000000,
+                            'limit_price': retry_short_price
+                        }
+                    }
+                    
+                    retry_results = await asyncio.gather(
+                        self.run_worker_command(account1_config, retry_long_cmd),
+                        self.run_worker_command(account2_config, retry_short_cmd),
+                        return_exceptions=True
+                    )
+                    
+                    # Check placement success
+                    if any(isinstance(r, Exception) or not r.get('success', False) for r in retry_results):
+                        logger.error(f"❌ Retry order placement failed after asymmetric close")
+                        return False, f"Retry failed after asymmetric close for {market_symbol}"
+                    
+                    # Wait for retry orders
+                    retry_wait_time = self.config.limit_order_wait_time // 2
+                    logger.info(f"   Waiting {retry_wait_time}s for retry orders to fill...")
+                    await asyncio.sleep(retry_wait_time)
+                    
+                    # Check retry fills
+                    retry_long_check = await self.run_worker_command(account1_config, {
+                        'command': 'get_order_status',
+                        'order': {'market_index': selected_market, 'order_id': (timestamp_ms + 30) % 1000000}
+                    })
+                    retry_short_check = await self.run_worker_command(account2_config, {
+                        'command': 'get_order_status',
+                        'order': {'market_index': selected_market, 'order_id': (timestamp_ms + 31) % 1000000}
+                    })
+                    
+                    retry_long_filled = retry_long_check.get('filled', False)
+                    retry_short_filled = retry_short_check.get('filled', False)
+                    
+                    # If both filled now - Success!
+                    if retry_long_filled and retry_short_filled:
+                        logger.info(f"✅ Both retry orders filled after asymmetric close!")
+                        # Keep long_success and short_success True
+                    else:
+                        # Give up - cancel unfilled orders and close any newly filled positions
+                        logger.warning(f"⚠️  Retry incomplete after asymmetric close (Long: {retry_long_filled}, Short: {retry_short_filled})")
+                        
+                        if not retry_long_filled:
+                            await self.run_worker_command(account1_config, {
+                                'command': 'cancel_order',
+                                'order': {'market_index': selected_market, 'order_id': (timestamp_ms + 30) % 1000000}
+                            })
+                        
+                        if not retry_short_filled:
+                            await self.run_worker_command(account2_config, {
+                                'command': 'cancel_order',
+                                'order': {'market_index': selected_market, 'order_id': (timestamp_ms + 31) % 1000000}
+                            })
+                        
+                        # Close any new filled positions from retry
+                        if retry_long_filled:
+                            await self.run_worker_command(account1_config, {
+                                'command': 'execute_true_market_order',
+                                'order': {
+                                    'market_index': selected_market,
+                                    'base_amount': base_amount,
+                                    'is_ask': True,
+                                    'client_order_index': (timestamp_ms + 40) % 1000000,
+                                    'execution_price': 1,
+                                    'reduce_only': True
+                                }
+                            })
+                        
+                        if retry_short_filled:
+                            await self.run_worker_command(account2_config, {
+                                'command': 'execute_true_market_order',
+                                'order': {
+                                    'market_index': selected_market,
+                                    'base_amount': base_amount,
+                                    'is_ask': False,
+                                    'client_order_index': (timestamp_ms + 41) % 1000000,
+                                    'execution_price': 999999999,
+                                    'reduce_only': True
+                                }
+                            })
+                        
+                        return False, f"Failed to establish delta-neutral position after retry for {market_symbol}"
             
             # For market orders, log immediately
             if not use_limit_order:
